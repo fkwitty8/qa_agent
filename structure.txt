@@ -1,0 +1,34 @@
+qa_agent/
+├── README.md
+├── .env.example
+├── requirements.txt
+├── docs/
+│   ├── requirements/
+│   │   └── user-stories.md
+│   ├── architecture/
+│   │   ├── foundation-model-selection.md
+│   │   └── architecture-diagram.png
+│   ├── weekly-reports/
+│   │   └── week1-report.md
+│   └── evaluation/
+│       └── evaluation-plan.md
+├── prompts/
+│   ├── test_planner.txt
+│   ├── test_runner.txt
+│   └── issue_drafter.txt
+├── knowledge/
+│   └── .gitkeep (no restricted data committed)
+├── src/
+│   ├── __init__.py
+│   ├── llm_client.py
+│   ├── agent.py
+│   ├── tools.py
+│   └── main.py
+├── tests/
+│   └── test_agent.py
+└── evidence/
+    ├── traces/
+    ├── screenshots/
+    │   ├── github-setup.png
+    │   └── clickup-setup.png
+    └── demo/
