@@ -46,6 +46,19 @@ own codebase, not user PII.
 
 ---
 
+### DeepSeek (free API) ❌ Not selected
+
+| Property | Value |
+|---|---|
+| Context window | 64k tokens |
+| Free tier | Yes — limited credits |
+| Function calling | Yes |
+| Embedding model | None — separate provider required |
+
+**Reason rejected:** During Week 2 integration testing, the free-tier API returned frequent 503 errors during off-peak hours, making it unreliable for interactive development. More critically, DeepSeek provides no co-located embedding model, which would have required adding a second API provider solely for the RAG pipeline. This defeats the single-key simplicity that Gemini provides.
+
+---
+
 ### GPT-4o (OpenAI) ❌ Not selected
 
 | Property | Value |

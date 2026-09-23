@@ -72,7 +72,7 @@ Ten manual test cases were run against both prompts (5 each) using `gemini-2.0-f
 
 | Artefact | Link |
 |---|---|
-| GitHub repo | https://github.com/fkwitty8/qa_agent |
+| GitHub repo | https://github.com/fkwitty8/qa_agent  |
 | ClickUp board | https://app.clickup.com/90141606668/v/li/901420225013 |
 
 ---
