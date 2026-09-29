@@ -44,13 +44,15 @@ logger = logging.getLogger(__name__)
 # Project root — one level above this file (src/)
 _PROJECT_ROOT = Path(__file__).parent.parent
 
-# Directories to crawl, relative to project root
-_CRAWL_DIRS: list[tuple[Path, list[str]]] = [
-    (_PROJECT_ROOT / "src",     [".py"]),
-    (_PROJECT_ROOT / "tests",   [".py"]),
-    (_PROJECT_ROOT / "prompts", [".txt", ".md"]),
-    (_PROJECT_ROOT / "docs",    [".md"]),
-    (_PROJECT_ROOT / "knowledge", [".md"]),
+# Directories to crawl — each entry is (path, extensions, recursive).
+# recursive=False limits the crawl to the top level of that directory only.
+_CRAWL_DIRS: list[tuple[Path, list[str], bool]] = [
+    (_PROJECT_ROOT,               [".md"],        False),  # root .md only (IMPLEMENTATION_PLAN, capstone, README)
+    (_PROJECT_ROOT / "src",       [".py"],        True),
+    (_PROJECT_ROOT / "tests",     [".py"],        True),
+    (_PROJECT_ROOT / "prompts",   [".txt", ".md"],True),
+    (_PROJECT_ROOT / "docs",      [".md"],        True),
+    (_PROJECT_ROOT / "knowledge", [".md"],        True),
 ]
 
 # Exclude patterns (substring match against full path)
@@ -89,13 +91,17 @@ def build_index(force: bool = False) -> int:
     collection = _get_collection(force=force)
     total = 0
 
-    for directory, extensions in _CRAWL_DIRS:
+    for directory, extensions, recursive in _CRAWL_DIRS:
         if not directory.is_dir():
             logger.debug("Skipping missing directory: %s", directory)
             continue
 
         for ext in extensions:
-            for filepath in sorted(directory.rglob(f"*{ext}")):
+            pattern = f"*{ext}"
+            file_iter = sorted(
+                directory.rglob(pattern) if recursive else directory.glob(pattern)
+            )
+            for filepath in file_iter:
                 if _should_exclude(filepath):
                     continue
 

@@ -115,7 +115,7 @@ def test_build_index_indexes_python_file(tmp_corpus, monkeypatch):
     monkeypatch.setattr(rag, "_PROJECT_ROOT", tmp_corpus)
     monkeypatch.setattr(
         rag, "_CRAWL_DIRS",
-        [(tmp_corpus / "src", [".py"])],
+        [(tmp_corpus / "src", [".py"], True)],
     )
 
     with patch("src.rag.chromadb.PersistentClient", return_value=mock_client), \
@@ -138,7 +138,7 @@ def test_build_index_indexes_markdown_file(tmp_corpus, monkeypatch):
     monkeypatch.setattr(rag, "_PROJECT_ROOT", tmp_corpus)
     monkeypatch.setattr(
         rag, "_CRAWL_DIRS",
-        [(tmp_corpus / "docs", [".md"])],
+        [(tmp_corpus / "docs", [".md"], True)],
     )
 
     with patch("src.rag.chromadb.PersistentClient", return_value=mock_client), \
@@ -164,7 +164,7 @@ def test_build_index_skips_tiny_files(tmp_path, monkeypatch):
     mock_client = _make_mock_chroma_client(collection)
 
     monkeypatch.setattr(rag, "_PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(rag, "_CRAWL_DIRS", [(src_dir, [".py"])])
+    monkeypatch.setattr(rag, "_CRAWL_DIRS", [(src_dir, [".py"], True)])
 
     with patch("src.rag.chromadb.PersistentClient", return_value=mock_client), \
          patch("src.rag.llm_client.embed", return_value=[0.0] * 768):
@@ -197,8 +197,8 @@ def test_build_index_skips_excluded_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(
         rag, "_CRAWL_DIRS",
         [
-            (cache_dir, [".py"]),
-            (versions_dir, [".txt"]),
+            (cache_dir, [".py"], True),
+            (versions_dir, [".txt"], True),
         ],
     )
 
