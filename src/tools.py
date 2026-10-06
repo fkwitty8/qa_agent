@@ -5,19 +5,20 @@ Each tool is defined by a schema dict (TOOL_REGISTRY) and a callable.
 Only tools listed in TOOL_REGISTRY are permitted; calls to any other
 tool name are rejected with a ToolNotAllowedError.
 
-Tools implemented here (Task 4):
-  - propose_tests   — RAG + Gemini → structured test plan
-  - run_tests       — syntax check → Docker → pytest results
-
-Tools implemented in Task 5 (stubs here, filled in next task):
-  - analyze_failures
-  - draft_issue
+Tools implemented here (Tasks 4 & 5):
+  - propose_tests    — RAG + Gemini → structured test plan
+  - run_tests        — syntax check → Docker → pytest results
+  - analyze_failures — Gemini → structured root-cause analysis
+  - draft_issue      — GitHub issue draft; posts only when approved=True
 
 Usage:
     from src.tools import call_tool
 
-    plan   = call_tool("propose_tests", {"issue_description": "test the RAG module"})
-    result = call_tool("run_tests", {"test_code": plan["test_cases"][0]["code"]})
+    plan     = call_tool("propose_tests", {"issue_description": "test the RAG module"})
+    result   = call_tool("run_tests", {"test_code": plan["test_cases"][0]["code"]})
+    analysis = call_tool("analyze_failures", {"test_results": result})
+    draft    = call_tool("draft_issue", {"analysis": analysis})              # draft only
+    posted   = call_tool("draft_issue", {"analysis": analysis, "approved": True})  # posts
 """
 
 import ast
@@ -32,6 +33,7 @@ from typing import Any
 import docker
 import docker.errors
 from dotenv import load_dotenv
+from github import Github, GithubException
 
 from src import llm_client, rag
 from src.prompt_loader import fill_template, load_prompt
@@ -108,9 +110,17 @@ TOOL_REGISTRY: dict[str, dict] = {
     },
     "analyze_failures": {
         "name": "analyze_failures",
-        "description": "Analyse pytest failure output and produce a root-cause summary (Task 5).",
+        "description": (
+            "Retrieve relevant source context via RAG, then call Gemini with "
+            "the failure_analyzer prompt to produce a structured root-cause "
+            "analysis of pytest failure output."
+        ),
         "input_schema": {
-            "test_results": {"type": "dict", "required": True}
+            "test_results": {
+                "type": "dict",
+                "required": True,
+                "description": "Output dict from run_tests (must contain 'stdout' and 'status').",
+            }
         },
         "output_schema": {
             "summary": "string",
@@ -119,27 +129,47 @@ TOOL_REGISTRY: dict[str, dict] = {
             "suggested_fix": "string",
             "confidence": "string — high | medium | low",
         },
-        "permissions": ["call:llm"],
-        "failure_behaviour": "Returns dict with 'error' key on LLM failure.",
+        "permissions": ["read:corpus", "call:llm"],
+        "failure_behaviour": "Returns dict with 'error' key on LLM failure. Never raises.",
     },
     "draft_issue": {
         "name": "draft_issue",
         "description": (
-            "Draft a GitHub issue from a failure analysis. "
-            "Only posts when approved=True (Task 5)."
+            "Format a failure analysis into a GitHub issue using the "
+            "issue_drafter prompt, then optionally post it via PyGithub. "
+            "The GitHub API is only called when approved=True."
         ),
         "input_schema": {
-            "analysis": {"type": "dict", "required": True},
-            "approved": {"type": "bool", "required": False, "default": False},
+            "analysis": {
+                "type": "dict",
+                "required": True,
+                "description": "Output dict from analyze_failures.",
+            },
+            "approved": {
+                "type": "bool",
+                "required": False,
+                "default": False,
+                "description": "Set True to post to GitHub. Default False (draft only).",
+            },
+            "goal": {
+                "type": "string",
+                "required": False,
+                "default": "",
+                "description": "Original agent goal string for traceability in the issue body.",
+            },
         },
         "output_schema": {
-            "title": "string",
-            "body": "string — markdown",
-            "labels": "list[string]",
-            "github_url": "string | None — None until approved and posted",
+            "title": "string — max 72 chars",
+            "body": "string — markdown issue body",
+            "labels": "list[string] — ['bug', 'qa-agent']",
+            "github_url": "string | None — None until approved=True and posted",
         },
-        "permissions": ["call:github_api (only when approved=True)"],
-        "failure_behaviour": "Returns dict with 'error' key on auth or API failure.",
+        "permissions": ["call:llm", "call:github_api (only when approved=True)"],
+        "failure_behaviour": (
+            "Returns dict with 'error' key on auth or API failure. "
+            "Draft is always returned regardless of posting outcome. "
+            "Never raises to caller."
+        ),
     },
 }
 
@@ -399,36 +429,235 @@ def run_tests(test_code: str, timeout: int = 30) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tool 3 & 4: stubs — implemented in Task 5
+# Tool 3: analyze_failures
 # ---------------------------------------------------------------------------
 
 def analyze_failures(test_results: dict) -> dict:
     """Analyse pytest failure output and return a structured root-cause summary.
 
-    Full implementation in Task 5. Returns a 'not implemented' error for now.
+    Retrieves relevant source context via RAG using the failed test output as
+    the query, then calls Gemini with the failure_analyzer prompt.
+
+    Args:
+        test_results: Output dict from run_tests — must contain 'stdout'.
+
+    Returns:
+        dict with keys: summary, root_cause, affected_files, suggested_fix,
+        confidence. An 'error' key is present only on failure.
     """
+    stdout = test_results.get("stdout", "")
+    status = test_results.get("status", "")
+
+    # If tests passed there is nothing to analyse
+    if status == "passed":
+        return {
+            "summary":       "All tests passed. No failures to analyse.",
+            "root_cause":    "None identified.",
+            "affected_files": [],
+            "suggested_fix": "No fix required.",
+            "confidence":    "high",
+        }
+
+    # Retrieve relevant source context using the failure output as the query
+    try:
+        query = stdout[:500] if stdout else "test failure analysis"
+        chunks = rag.retrieve(query, top_k=5)
+    except Exception as exc:
+        logger.warning("RAG retrieval skipped in analyze_failures: %s", exc)
+        chunks = []
+
+    source_context = _format_context(chunks)
+
+    # Call Gemini with the failure_analyzer prompt
+    try:
+        template = load_prompt("failure_analyzer")
+        prompt = fill_template(template, {
+            "SOURCE_CONTEXT": source_context,
+            "TEST_RESULTS":   stdout,
+        })
+        raw = llm_client.generate(prompt)
+    except Exception as exc:
+        logger.error("LLM call failed in analyze_failures: %s", exc)
+        return {
+            "summary": "", "root_cause": "", "affected_files": [],
+            "suggested_fix": "", "confidence": "low",
+            "error": f"LLM call failed: {exc}",
+        }
+
+    try:
+        clean = _strip_fences(raw)
+        analysis = json.loads(clean)
+    except json.JSONDecodeError as exc:
+        logger.error("JSON parse failed in analyze_failures: %s", exc)
+        return {
+            "summary": "", "root_cause": "", "affected_files": [],
+            "suggested_fix": "", "confidence": "low",
+            "error": f"Model returned non-JSON output: {exc}. Raw: {raw[:200]}",
+        }
+
+    # Normalise — ensure all expected keys are present
     return {
-        "error": "analyze_failures not yet implemented — coming in Task 5.",
-        "summary": "",
-        "root_cause": "",
-        "affected_files": [],
-        "suggested_fix": "",
-        "confidence": "low",
+        "summary":        analysis.get("summary", ""),
+        "root_cause":     analysis.get("root_cause", ""),
+        "affected_files": analysis.get("affected_files", []),
+        "suggested_fix":  analysis.get("suggested_fix", ""),
+        "confidence":     analysis.get("confidence", "low"),
     }
 
 
-def draft_issue(analysis: dict, approved: bool = False) -> dict:
-    """Draft (and optionally post) a GitHub issue from a failure analysis.
+# ---------------------------------------------------------------------------
+# Tool 4: draft_issue
+# ---------------------------------------------------------------------------
 
-    Full implementation in Task 5. Returns a 'not implemented' error for now.
+def draft_issue(
+    analysis: dict,
+    approved: bool = False,
+    goal: str = "",
+) -> dict:
+    """Draft a GitHub issue from a failure analysis; post only when approved.
+
+    The issue body is generated by calling Gemini with the issue_drafter prompt,
+    which formats the analysis into readable markdown.  The draft is always
+    returned for UI preview.  The GitHub API is called ONLY when approved=True.
+
+    Args:
+        analysis: Output dict from analyze_failures.
+        approved: If True, post the issue to GitHub via PyGithub.
+                  Defaults to False — draft only, no network call.
+        goal:     The original agent goal string, included in the issue body
+                  for traceability.
+
+    Returns:
+        dict with keys: title, body, labels, github_url.
+        github_url is None until approved=True and the post succeeds.
+        An 'error' key is present only on failure.
     """
-    return {
-        "error": "draft_issue not yet implemented — coming in Task 5.",
-        "title": "",
-        "body": "",
-        "labels": ["bug", "qa-agent"],
+    labels = ["bug", "qa-agent"]
+
+    # --- Generate markdown body via Gemini ---
+    try:
+        template = load_prompt("issue_drafter")
+        prompt = fill_template(template, {
+            "ANALYSIS": json.dumps(analysis, indent=2),
+            "GOAL":     goal or "Not specified.",
+        })
+        raw = llm_client.generate(prompt)
+        clean = _strip_fences(raw)
+        drafted = json.loads(clean)
+        title = drafted.get("title", "QA Agent: test failure detected")[:72]
+        body  = drafted.get("body", _fallback_body(analysis, goal))
+    except Exception as exc:
+        logger.warning(
+            "LLM issue drafting failed, using fallback body: %s", exc
+        )
+        title = _fallback_title(analysis)
+        body  = _fallback_body(analysis, goal)
+
+    draft = {
+        "title":      title,
+        "body":       body,
+        "labels":     labels,
         "github_url": None,
     }
+
+    # --- Human approval gate ---
+    if not approved:
+        logger.info(
+            "Issue draft ready — awaiting human approval before posting.",
+            extra={"event": "draft_issue_pending", "title": title},
+        )
+        return draft
+
+    # --- Post to GitHub (only reached when approved=True) ---
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    repo_name = os.getenv("GITHUB_REPO", "").strip()
+
+    if not token:
+        return {**draft, "error": (
+            "GITHUB_TOKEN is not set. "
+            "Add it to .env to enable GitHub issue posting."
+        )}
+    if not repo_name:
+        return {**draft, "error": (
+            "GITHUB_REPO is not set. "
+            "Add it to .env in 'owner/repo' format."
+        )}
+
+    try:
+        gh = Github(token)
+        repo = gh.get_repo(repo_name)
+        issue = repo.create_issue(
+            title=title,
+            body=body,
+            labels=labels,
+        )
+        github_url = issue.html_url
+        logger.info(
+            "Issue posted to GitHub",
+            extra={"event": "draft_issue_posted", "url": github_url},
+        )
+        return {**draft, "github_url": github_url}
+
+    except GithubException as exc:
+        status_code = getattr(exc, "status", None)
+        if status_code in (401, 403):
+            msg = (
+                f"GitHub authentication failed (HTTP {status_code}). "
+                "Check that GITHUB_TOKEN is valid and has 'repo' scope."
+            )
+        elif status_code == 404:
+            msg = (
+                f"GitHub repo '{repo_name}' not found (HTTP 404). "
+                "Check GITHUB_REPO is in 'owner/repo' format and the token has access."
+            )
+        else:
+            msg = f"GitHub API error (HTTP {status_code}): {exc}"
+        logger.error("GitHub issue post failed: %s", msg)
+        return {**draft, "error": msg}
+    except Exception as exc:
+        msg = f"Unexpected error posting GitHub issue: {exc}"
+        logger.error(msg)
+        return {**draft, "error": msg}
+
+
+# ---------------------------------------------------------------------------
+# Fallback formatters (used when issue_drafter LLM call fails)
+# ---------------------------------------------------------------------------
+
+def _fallback_title(analysis: dict) -> str:
+    """Generate a plain-text issue title from the analysis summary."""
+    summary = analysis.get("summary", "")
+    if summary:
+        # Truncate to 72 chars, trim at last word boundary
+        title = f"QA Agent: {summary}"
+        if len(title) > 72:
+            title = title[:69].rsplit(" ", 1)[0] + "..."
+        return title
+    return "QA Agent: test failure detected"
+
+
+def _fallback_body(analysis: dict, goal: str) -> str:
+    """Generate a markdown issue body directly from the analysis dict."""
+    affected = "\n".join(
+        f"- `{f}`" for f in analysis.get("affected_files", [])
+    ) or "- Not identified"
+
+    return (
+        "## Summary\n\n"
+        f"{analysis.get('summary', '_Not available._')}\n\n"
+        "## Root Cause\n\n"
+        f"{analysis.get('root_cause', '_Not identified._')}\n\n"
+        "## Affected Files\n\n"
+        f"{affected}\n\n"
+        "## Suggested Fix\n\n"
+        f"{analysis.get('suggested_fix', '_Not available._')}\n\n"
+        "## Confidence\n\n"
+        f"{analysis.get('confidence', 'low').capitalize()}\n\n"
+        "## Context\n\n"
+        f"**Goal:** {goal or 'Not specified.'}\n\n"
+        "_This issue was drafted automatically by the QA Agent "
+        "and requires human review before any action is taken._\n"
+    )
 
 
 # ---------------------------------------------------------------------------

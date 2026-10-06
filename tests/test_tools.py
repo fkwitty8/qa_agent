@@ -352,3 +352,271 @@ def test_parse_pytest_counts_mixed():
 def test_parse_pytest_counts_no_summary():
     """Returns (0, 0) gracefully when no summary line is present."""
     assert _parse_pytest_counts("no pytest output here") == (0, 0)
+
+
+# ===========================================================================
+# Task 5 tests — analyze_failures and draft_issue
+# ===========================================================================
+
+from src.tools import analyze_failures, draft_issue, _fallback_body, _fallback_title
+
+SAMPLE_TEST_RESULTS_FAILED = {
+    "status": "failed",
+    "passed": 0,
+    "failed": 1,
+    "stdout": "FAILED tests/test_rag.py::test_retrieve - AssertionError\n1 failed in 0.12s",
+    "stderr": "",
+    "exit_code": 1,
+}
+
+SAMPLE_TEST_RESULTS_PASSED = {
+    "status": "passed",
+    "passed": 3,
+    "failed": 0,
+    "stdout": "3 passed in 0.10s",
+    "stderr": "",
+    "exit_code": 0,
+}
+
+SAMPLE_ANALYSIS = {
+    "summary": "retrieve() raises when collection is empty.",
+    "root_cause": "rag.retrieve() does not guard against empty collection before querying.",
+    "affected_files": ["src/rag.py"],
+    "suggested_fix": "Add `if collection.count() == 0: return []` before the query call.",
+    "confidence": "high",
+}
+
+VALID_DRAFT_JSON = json.dumps({
+    "title": "rag: retrieve() raises on empty collection",
+    "body": "## Summary\n\nretrieve() raises when the collection is empty.\n",
+})
+
+
+# ---------------------------------------------------------------------------
+# Test 17: analyze_failures() — happy path, returns structured analysis
+# ---------------------------------------------------------------------------
+
+def test_analyze_failures_happy_path():
+    """analyze_failures() returns all required keys on a successful LLM call."""
+    analysis_json = json.dumps({
+        "summary": "One test failed due to missing guard.",
+        "root_cause": "retrieve() in src/rag.py line 42.",
+        "affected_files": ["src/rag.py"],
+        "suggested_fix": "Add empty-collection check.",
+        "confidence": "high",
+    })
+
+    with patch("src.tools.rag.retrieve", return_value=[]), \
+         patch("src.tools.load_prompt", return_value="{{SOURCE_CONTEXT}} {{TEST_RESULTS}}"), \
+         patch("src.tools.llm_client.generate", return_value=analysis_json):
+
+        result = analyze_failures(SAMPLE_TEST_RESULTS_FAILED)
+
+    assert "error" not in result
+    assert result["summary"] != ""
+    assert result["root_cause"] != ""
+    assert isinstance(result["affected_files"], list)
+    assert result["confidence"] in ("high", "medium", "low")
+
+
+# ---------------------------------------------------------------------------
+# Test 18: analyze_failures() — short-circuits when all tests passed
+# ---------------------------------------------------------------------------
+
+def test_analyze_failures_short_circuits_on_passed():
+    """analyze_failures() returns a no-failure summary without calling LLM."""
+    with patch("src.tools.llm_client.generate") as mock_llm:
+        result = analyze_failures(SAMPLE_TEST_RESULTS_PASSED)
+
+    mock_llm.assert_not_called()
+    assert "All tests passed" in result["summary"]
+    assert result["confidence"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# Test 19: analyze_failures() — LLM failure returns error dict, does not raise
+# ---------------------------------------------------------------------------
+
+def test_analyze_failures_llm_failure_returns_error():
+    """analyze_failures() returns an error dict when the LLM call raises."""
+    with patch("src.tools.rag.retrieve", return_value=[]), \
+         patch("src.tools.load_prompt", return_value="{{SOURCE_CONTEXT}} {{TEST_RESULTS}}"), \
+         patch("src.tools.llm_client.generate", side_effect=RuntimeError("503")):
+
+        result = analyze_failures(SAMPLE_TEST_RESULTS_FAILED)
+
+    assert "error" in result
+    assert "LLM call failed" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Test 20: analyze_failures() — non-JSON model output returns error dict
+# ---------------------------------------------------------------------------
+
+def test_analyze_failures_non_json_response_returns_error():
+    """analyze_failures() returns an error dict when the model returns non-JSON."""
+    with patch("src.tools.rag.retrieve", return_value=[]), \
+         patch("src.tools.load_prompt", return_value="{{SOURCE_CONTEXT}} {{TEST_RESULTS}}"), \
+         patch("src.tools.llm_client.generate", return_value="I cannot help with that."):
+
+        result = analyze_failures(SAMPLE_TEST_RESULTS_FAILED)
+
+    assert "error" in result
+    assert "non-JSON" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Test 21: draft_issue() — approved=False returns draft without posting
+# ---------------------------------------------------------------------------
+
+def test_draft_issue_no_post_when_not_approved():
+    """draft_issue() returns draft dict and does NOT call PyGithub when approved=False."""
+    with patch("src.tools.load_prompt", return_value="{{ANALYSIS}} {{GOAL}}"), \
+         patch("src.tools.llm_client.generate", return_value=VALID_DRAFT_JSON), \
+         patch("src.tools.Github") as mock_gh:
+
+        result = draft_issue(SAMPLE_ANALYSIS, approved=False)
+
+    mock_gh.assert_not_called()
+    assert result["github_url"] is None
+    assert result["title"] != ""
+    assert result["body"] != ""
+    assert "bug" in result["labels"]
+    assert "error" not in result
+
+
+# ---------------------------------------------------------------------------
+# Test 22: draft_issue() — issue body is well-formed markdown
+# ---------------------------------------------------------------------------
+
+def test_draft_issue_body_is_markdown():
+    """draft_issue() body contains markdown headings."""
+    with patch("src.tools.load_prompt", return_value="{{ANALYSIS}} {{GOAL}}"), \
+         patch("src.tools.llm_client.generate", return_value=VALID_DRAFT_JSON):
+
+        result = draft_issue(SAMPLE_ANALYSIS, approved=False)
+
+    assert "##" in result["body"]
+
+
+# ---------------------------------------------------------------------------
+# Test 23: draft_issue() — approved=True posts to GitHub and returns URL
+# ---------------------------------------------------------------------------
+
+def test_draft_issue_posts_when_approved(monkeypatch):
+    """draft_issue() calls repo.create_issue and returns github_url when approved=True."""
+    monkeypatch.setenv("GITHUB_TOKEN", "fake-token")
+    monkeypatch.setenv("GITHUB_REPO", "org/repo")
+
+    mock_issue = MagicMock()
+    mock_issue.html_url = "https://github.com/org/repo/issues/42"
+
+    mock_repo = MagicMock()
+    mock_repo.create_issue.return_value = mock_issue
+
+    mock_gh_instance = MagicMock()
+    mock_gh_instance.get_repo.return_value = mock_repo
+
+    with patch("src.tools.load_prompt", return_value="{{ANALYSIS}} {{GOAL}}"), \
+         patch("src.tools.llm_client.generate", return_value=VALID_DRAFT_JSON), \
+         patch("src.tools.Github", return_value=mock_gh_instance):
+
+        result = draft_issue(SAMPLE_ANALYSIS, approved=True, goal="test RAG module")
+
+    mock_repo.create_issue.assert_called_once()
+    assert result["github_url"] == "https://github.com/org/repo/issues/42"
+    assert "error" not in result
+
+
+# ---------------------------------------------------------------------------
+# Test 24: draft_issue() — auth failure (401) returns descriptive error
+# ---------------------------------------------------------------------------
+
+def test_draft_issue_auth_failure_returns_error(monkeypatch):
+    """draft_issue() returns an error dict with a clear message on 401."""
+    from github import GithubException
+
+    monkeypatch.setenv("GITHUB_TOKEN", "bad-token")
+    monkeypatch.setenv("GITHUB_REPO", "org/repo")
+
+    mock_repo = MagicMock()
+    mock_repo.create_issue.side_effect = GithubException(401, "Bad credentials", None)
+
+    mock_gh_instance = MagicMock()
+    mock_gh_instance.get_repo.return_value = mock_repo
+
+    with patch("src.tools.load_prompt", return_value="{{ANALYSIS}} {{GOAL}}"), \
+         patch("src.tools.llm_client.generate", return_value=VALID_DRAFT_JSON), \
+         patch("src.tools.Github", return_value=mock_gh_instance):
+
+        result = draft_issue(SAMPLE_ANALYSIS, approved=True)
+
+    assert "error" in result
+    assert "authentication failed" in result["error"]
+    assert result["github_url"] is None
+
+
+# ---------------------------------------------------------------------------
+# Test 25: draft_issue() — missing GITHUB_TOKEN returns error without posting
+# ---------------------------------------------------------------------------
+
+def test_draft_issue_missing_token_returns_error(monkeypatch):
+    """draft_issue() returns an error dict when GITHUB_TOKEN is not set."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_REPO", "org/repo")
+
+    with patch("src.tools.load_prompt", return_value="{{ANALYSIS}} {{GOAL}}"), \
+         patch("src.tools.llm_client.generate", return_value=VALID_DRAFT_JSON), \
+         patch("src.tools.Github") as mock_gh:
+
+        result = draft_issue(SAMPLE_ANALYSIS, approved=True)
+
+    mock_gh.assert_not_called()
+    assert "error" in result
+    assert "GITHUB_TOKEN" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Test 26: draft_issue() — LLM failure uses fallback body (no crash)
+# ---------------------------------------------------------------------------
+
+def test_draft_issue_uses_fallback_when_llm_fails():
+    """draft_issue() returns a valid draft using fallback formatters when LLM fails."""
+    with patch("src.tools.load_prompt", side_effect=FileNotFoundError("not found")):
+        result = draft_issue(SAMPLE_ANALYSIS, approved=False, goal="test RAG")
+
+    assert result["title"] != ""
+    assert "## Summary" in result["body"]
+    assert result["github_url"] is None
+    assert "error" not in result
+
+
+# ---------------------------------------------------------------------------
+# Test 27: _fallback_body() — contains all required markdown sections
+# ---------------------------------------------------------------------------
+
+def test_fallback_body_contains_required_sections():
+    """_fallback_body() generates a body with all six markdown sections."""
+    body = _fallback_body(SAMPLE_ANALYSIS, "test the RAG module")
+
+    for section in ("## Summary", "## Root Cause", "## Affected Files",
+                    "## Suggested Fix", "## Confidence", "## Context"):
+        assert section in body, f"Missing section: {section}"
+
+    assert "src/rag.py" in body
+    assert "QA Agent" in body
+
+
+# ---------------------------------------------------------------------------
+# Test 28: _fallback_title() — truncates long summaries to 72 chars
+# ---------------------------------------------------------------------------
+
+def test_fallback_title_truncates_long_summary():
+    """_fallback_title() keeps the title under 72 characters."""
+    long_analysis = {
+        "summary": "This is a very long summary that goes well beyond the "
+                   "seventy-two character limit set for GitHub issue titles."
+    }
+    title = _fallback_title(long_analysis)
+    assert len(title) <= 72
+    assert title.endswith("...")
