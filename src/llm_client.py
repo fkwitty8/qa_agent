@@ -77,7 +77,7 @@ def generate(
         system_prompt: Optional system / role instruction prepended to the
                        conversation.
         model:         Gemini model ID.  Defaults to the GEMINI_MODEL env var
-                       (fallback: ``gemini-2.0-flash``).
+                       (fallback: ``gemini-3.8-flash``).
         temperature:   Sampling temperature (lower = more deterministic).
 
     Returns:
@@ -88,7 +88,7 @@ def generate(
         ValueError:        The model returned an empty response.
         RuntimeError:      Any other API-level error, wrapped with context.
     """
-    model_id = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    model_id = model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     client = _get_client()
 
     # Build the contents list — system prompt is passed via config, not contents

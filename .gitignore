@@ -1,1 +1,25 @@
+# Secrets
 .env
+
+# Persistent memory — contains run history and issue drafts
+evidence/qa_agent.db
+
+# ChromaDB vector store
+evidence/chroma_db/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Streamlit agent skills (environment-specific symlinks)
+.agents/skills/
+.claude/skills/
+
+# Virtual environments
+.venv/
+venv/
+env/

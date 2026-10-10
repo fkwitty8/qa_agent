@@ -5,7 +5,63 @@
 
 ---
 
-## Work Completed Against Weekly Objectives
+## Work Completed Against Week 5 Capstone Deliverables
+
+The capstone Week 5 focus is **Agent Architecture and Bounded Autonomy**. The implementation plan placed `analyze_failures` and `draft_issue` in this week, but the capstone deliverables require the full bounded agent loop. Both were completed.
+
+### Bounded Agent Loop — src/agents.py
+
+`QAAgent` was implemented with a `run(goal)` method wiring all four tools into the SENSE→PLAN→ACT→OBSERVE→DECIDE loop. Key behaviours:
+
+- **Input validation** rejects empty goals, goals over 2 000 characters, and goals matching prompt injection patterns (`"ignore previous instructions"`, `"you are now"`, etc.) before any tool is called.
+- **SENSE** calls `rag.retrieve(goal, top_k=5)` once and reuses the context across all iterations — avoids re-embedding on every cycle.
+- **PLAN** calls `propose_tests(goal)`. An `"error"` key in the result stops the loop immediately (`status="error"`).
+- **ACT** calls `run_tests(combined_code)`. A `"Docker is unavailable"` error is treated as unrecoverable — the loop stops immediately.
+- **OBSERVE** calls `analyze_failures(test_results)` only when tests fail.
+- **DECIDE** either retries (iterations remain) or hands off (limit reached). `draft_issue(approved=False)` is called in both the pass and hand-off paths — a draft is always produced for human review.
+- **Trace** — every run writes a JSON step log to `evidence/traces/<run_id>.json` recording step name, tool called, input summary, output summary, decision, and UTC timestamp.
+- **Iteration limit** is read from `MAX_AGENT_ITERATIONS` in `.env` (default 3) and enforced by the loop condition — cannot be bypassed by tool output.
+
+### Agent Task Contract
+
+`docs/architecture/agent_task_contract.md` documents the full contract: goal definition, input constraints, loop structure, tools used, state fields, iteration limit, stop conditions, hand-off behaviour, trace schema, and security boundaries.
+
+### Agent Architecture Diagram
+
+Added to `docs/architecture/architectural_diagrams.md` — a Mermaid flowchart showing the full SENSE→PLAN→ACT→OBSERVE→DECIDE loop, all three stop conditions (passed, Docker error, iteration limit), the human approval gate, and trace write.
+
+### Three Execution Traces
+
+Three representative traces were captured and saved to `evidence/traces/`:
+
+| File | Scenario | Outcome |
+|---|---|---|
+| `trace_happy_path.json` | Normal: `retrieve()` empty-corpus test | `status="passed"`, 1 iteration |
+| `trace_recovery.json` | Recovery: whitespace API-key test fails iteration 1, passes iteration 2 | `status="passed"`, 2 iterations |
+| `trace_limit_hit.json` | Limit hit: generated tests import `src.*` unavailable in Docker sandbox | `status="handoff"`, 3 iterations |
+
+The limit-hit trace also surfaces a genuine finding: the `test_planner` prompt constraint says to import from `src.*`, but the Docker sandbox has no project installation. This is documented as a known limitation and a future prompt improvement.
+
+### Test Coverage
+
+18 unit tests were added to `tests/test_agent.py`:
+
+| Tests | Scenario |
+|---|---|
+| 1–2 | `status="passed"` on first success; exits early before limit |
+| 3–4 | `status="handoff"` at limit; handoff_msg contains iteration count |
+| 5–6 | `status="error"` on Docker unavailable; on plan failure |
+| 7–8 | Trace JSON written; trace contains SENSE/PLAN/ACT/DECIDE steps |
+| 9–11 | `status="error"` on empty goal, overlong goal, prompt injection |
+| 12 | Loop retries PLAN→ACT on repeated failure |
+| 13 | `draft_issue` always called with `approved=False` |
+| 14–15 | Empty test_cases handled gracefully; `_validate_goal` accepts normal input |
+
+Full test suite: **81/81 passing** across all five test files.
+
+---
+
+## Work Completed Against Weekly Objectives (Tools — Tasks 4 & 5)
 
 ### Tool 3: analyze_failures
 
@@ -52,7 +108,7 @@
 | 27 | `_fallback_body` contains all six required sections |
 | 28 | `_fallback_title` truncates long summaries to ≤72 chars |
 
-Full test suite: **63/63 passing** across all four test files.
+Full test suite: **81/81 passing** across all five test files.
 
 ---
 
@@ -70,7 +126,11 @@ Full test suite: **63/63 passing** across all four test files.
 
 ## Failures / Challenges and Current Response
 
-**No failures this week.** All 12 new tests passed first time. The pattern established in Task 4 — tools return error dicts, never raise — made the test structure straightforward to follow consistently.
+**Prompt injection in `_validate_goal` — `QAAgent()` instantiation overhead.** The module-level `_validate_goal()` function creates a `QAAgent()` instance for each call, which reads `.env` on every invocation. This is a minor inefficiency caught during test writing; for production the validation logic was extracted into a standalone function. Fixed before the tests ran.
+
+**`test_planner` prompt constraint conflicts with Docker sandbox isolation.** The trace `trace_limit_hit.json` surfaces a genuine limitation: the prompt instructs the model to import from `src.*`, but Docker sandbox has no project installed. Generated tests will import-error every time for goals about the agent's own tools. The fix (update the prompt constraint) is documented in the failure catalogue trace and scheduled for the Week 8 hardening pass.
+
+**Tools 3 and 4 (`analyze_failures`, `draft_issue`) were stub-only when the capstone Week 5 focus switched to the agent loop.** Both stubs were replaced with full implementations this week alongside the agent loop — no deliverables were deferred.
 
 ---
 
@@ -87,18 +147,17 @@ Full test suite: **63/63 passing** across all four test files.
 
 | Role | Member | Week 5 Responsibility |
 |---|---|---|
-| Project/Requirements Lead | Jim | Reviewed `draft_issue` approval gate against the AI Boundary Matrix; confirmed the "no auto-submit" boundary constraint is structurally enforced; updated ClickUp with Week 5 tasks and evidence links. |
-| Application/Integration Lead | Fahad | Implemented `analyze_failures()` and `draft_issue()` in `src/tools.py`; wrote `prompts/issue_drafter.txt` v1.0 and archived versioned copy; updated TOOL_REGISTRY schemas for both tools. |
-| AI Engineering Lead | Brenda | Updated `docs/architecture/tool_catalogue.md` with full schemas, step-by-step flows, and expanded error taxonomy for Tools 3 and 4; verified prompt structure consistency with existing prompts. |
-| Quality/Security Lead | Dorcus | Wrote `tests/test_tools.py` tests 17–28 (12 new cases); verified 63/63 full suite passing; authored this progress report. |
+| Project/Requirements Lead | Jim | Reviewed agent loop stop conditions and hand-off behaviour against the AI Boundary Matrix; confirmed `draft_issue` approval gate satisfies the "no auto-submit" boundary; updated ClickUp with Week 5 tasks and evidence links. |
+| Application/Integration Lead | Fahad | Implemented `src/agents.py` (`QAAgent`, bounded loop, input validation, trace writer); implemented `analyze_failures()` and `draft_issue()` in `src/tools.py`; wrote `prompts/issue_drafter.txt` v1.0. |
+| AI Engineering Lead | Brenda | Authored `docs/architecture/agent_task_contract.md`; added agent loop diagram to `docs/architecture/architectural_diagrams.md`; updated `docs/architecture/tool_catalogue.md` for Tools 3 and 4; created the three execution traces in `evidence/traces/`. |
+| Quality/Security Lead | Dorcus | Wrote `tests/test_agent.py` (18 test cases) and `tests/test_tools.py` tests 17–28 (12 cases); verified 81/81 full suite passing; authored this progress report. |
 
 ---
 
-## Plan for Next Week (Week 6 — Bounded Agent Loop)
+## Plan for Next Week (Week 6 — Memory, State & Streamlit UI)
 
-- Implement `src/agents.py`: `QAAgent` class with `run(goal)` method wiring all four tools into the SENSE→PLAN→ACT→OBSERVE→DECIDE loop.
-- Read `MAX_AGENT_ITERATIONS` from `.env` (default 3); stop and return a hand-off message when limit is reached.
-- Stop conditions: all tests pass, Docker unavailable (unrecoverable), iteration limit hit.
-- Capture a full execution trace per run — each step name, tool called, input summary, output summary, decision, timestamp — saved as JSON to `evidence/traces/<timestamp>.json`.
-- Write `docs/architecture/agent_task_contract.md`: goal definition, tools, state fields, iteration limit, stop conditions, hand-off behaviour.
-- Write unit tests for `QAAgent` with all tools mocked: assert loop stops at `MAX_AGENT_ITERATIONS`, assert trace JSON is written, assert hand-off message returned on limit, assert early exit when all tests pass.
+- Implement `src/memory.py`: SQLite-backed store at `evidence/qa_agent.db` with tables `runs` and `drafted_issues`; expose `save_run`, `get_run`, `list_runs`, `save_draft`, `update_draft_url`, `get_draft`.
+- Build `src/main.py` as the Streamlit app: sidebar run history, goal input, "Run Agent" button, live step progress, trace viewer, issue draft preview with "Submit to GitHub" approval form.
+- Add `docs/architecture/memory_design.md`: what is stored, retention policy, access controls, no-PII policy.
+- Write unit tests for `memory.py`: save/retrieve round-trips, reverse-chronological `list_runs`, graceful missing-key handling.
+- Demo target: run the agent twice via the UI, reload the page, show both runs in sidebar history, click one to view its trace and drafted issue.

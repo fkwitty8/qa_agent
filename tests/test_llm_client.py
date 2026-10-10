@@ -51,7 +51,7 @@ def _reload_client_module():
 def test_generate_happy_path(monkeypatch):
     """generate() returns the model's text when the API call succeeds."""
     monkeypatch.setenv("GEMINI_API_KEY", "fake-key-happy")
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.0-flash")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     mod = _reload_client_module()
     fake_response = _make_response("def test_foo(): assert 1 == 1")

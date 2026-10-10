@@ -1,0 +1,24 @@
+{
+  "run_id": "34cabb76491b",
+  "goal": "hello\n",
+  "started": "2026-10-10T08:11:09.272433+00:00",
+  "completed": "2026-10-10T08:11:10.466928+00:00",
+  "steps": [
+    {
+      "step": "SENSE",
+      "tool": "rag.retrieve",
+      "input_summary": "hello\n",
+      "output_summary": "0 chunk(s) retrieved",
+      "decision": "context ready for planning",
+      "timestamp_utc": "2026-10-10T08:11:09.274474+00:00"
+    },
+    {
+      "step": "PLAN",
+      "tool": "propose_tests",
+      "input_summary": "hello\n",
+      "output_summary": "test_cases=0",
+      "decision": "planning error: LLM call failed: Gemini API call failed: 404 NOT_FOUND. {'error': {'code': 404, ",
+      "timestamp_utc": "2026-10-10T08:11:10.464718+00:00"
+    }
+  ]
+}

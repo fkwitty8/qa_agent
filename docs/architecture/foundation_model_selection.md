@@ -2,11 +2,12 @@
 
 ## Decision Summary
 
-**Selected model:** Gemini 2.0 Flash (`gemini-2.0-flash`)  
+**Selected model:** Gemini 3.8 Flash (`gemini-3.8-flash`)  
 **Embedding model:** `models/text-embedding-004`  
 **Provider:** Google AI Studio (free tier)  
 **SDK:** `google-genai` 2.x (`from google import genai`)  
-**Decision date:** 2026-09-14
+**Decision date:** 2026-09-14  
+**Model updated:** 2026-10-10 — migrated from `gemini-2.0-flash` (shut down June 2026) to `gemini-3.8-flash`
 
 ---
 
