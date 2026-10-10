@@ -2,6 +2,55 @@
 
 ---
 
+## Agent Loop Architecture
+
+```mermaid
+flowchart TD
+    UI([User / Streamlit UI]) --> GOAL["goal: str"]
+    GOAL --> VAL{"Validate\ngoal"}
+    VAL -- "empty / too long\n/ injection" --> ERR1["status = 'error'\nreturn immediately"]
+    VAL -- valid --> SENSE
+
+    subgraph LOOP["🔁 Bounded Loop  —  max MAX_AGENT_ITERATIONS"]
+        direction TB
+        SENSE["SENSE\nrag.retrieve(goal, top_k=5)"] --> PLAN
+
+        PLAN["PLAN\npropose_tests(goal)"] -- "error" --> ERR2["status = 'error'\nreturn"]
+        PLAN -- "test_cases=[]" --> RETRY{"iterations\nleft?"}
+        PLAN -- "test_cases ≥ 1" --> ACT
+
+        ACT["ACT\nrun_tests(combined_code)"] -- "Docker\nunavailable" --> ERR3["status = 'error'\nreturn"]
+        ACT -- "status = passed" --> DRAFT1
+
+        ACT -- "status = failed" --> OBS
+
+        OBS["OBSERVE\nanalyze_failures(results)"] --> DEC
+
+        DEC{"DECIDE\niterations < MAX?"} -- "yes → retry" --> PLAN
+        DEC -- "no → hand off" --> DRAFT2
+
+        RETRY -- "yes" --> PLAN
+        RETRY -- "no" --> DRAFT2
+    end
+
+    DRAFT1["DECIDE\ndraft_issue(approved=False)\nstatus = 'passed'"] --> TRACE
+    DRAFT2["DECIDE\ndraft_issue(approved=False)\nstatus = 'handoff'"] --> TRACE
+
+    TRACE["Write trace JSON\nevidence/traces/<run_id>.json"] --> RESULT["Return result dict\n{status, draft, trace, ...}"]
+    ERR1 & ERR2 & ERR3 --> RESULT
+
+    RESULT --> HUMAN["👤 Human Review\nApprove → draft_issue(approved=True)\n→ GitHub Issue posted"]
+```
+
+**Key design decisions:**
+- **Context retrieved once** (SENSE) and reused across all iterations — avoids re-embedding on every cycle.
+- **Docker unavailable** is the only unrecoverable error — surfaces immediately without retrying.
+- **`approved=False` always** — the agent never posts to GitHub autonomously.
+- **Hard iteration cap** — `while iteration < max_iterations` cannot be bypassed by tool output.
+- **Trace written atomically** at run end — a crashed run leaves no partial trace file.
+
+---
+
 ## RAG Pipeline Architecture
 
 ```mermaid
