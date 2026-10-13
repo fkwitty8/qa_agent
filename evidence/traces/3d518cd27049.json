@@ -1,0 +1,40 @@
+{
+  "run_id": "3d518cd27049",
+  "goal": "test that memory.list_runs() returns runs newest first",
+  "started": "2026-10-13T06:38:49.644206+00:00",
+  "completed": "2026-10-13T06:40:03.887126+00:00",
+  "steps": [
+    {
+      "step": "SENSE",
+      "tool": "rag.retrieve",
+      "input_summary": "test that memory.list_runs() returns runs newest first",
+      "output_summary": "0 chunk(s) retrieved",
+      "decision": "context ready for planning",
+      "timestamp_utc": "2026-10-13T06:38:49.649189+00:00"
+    },
+    {
+      "step": "PLAN",
+      "tool": "propose_tests",
+      "input_summary": "test that memory.list_runs() returns runs newest first",
+      "output_summary": "test_cases=5",
+      "decision": "5 test case(s) proposed",
+      "timestamp_utc": "2026-10-13T06:39:31.630571+00:00"
+    },
+    {
+      "step": "ACT",
+      "tool": "run_tests",
+      "input_summary": "5 test case(s)",
+      "output_summary": "status=passed passed=5 failed=0",
+      "decision": "all passed",
+      "timestamp_utc": "2026-10-13T06:39:53.168810+00:00"
+    },
+    {
+      "step": "DECIDE",
+      "tool": "draft_issue",
+      "input_summary": "analysis + goal",
+      "output_summary": "title=memory.list_runs(): test failure",
+      "decision": "draft ready for human review",
+      "timestamp_utc": "2026-10-13T06:40:03.884998+00:00"
+    }
+  ]
+}

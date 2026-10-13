@@ -43,9 +43,11 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from src import rag
+from src.logging_config import configure_logging
 from src.tools import call_tool
 
 load_dotenv()
+configure_logging()   # activate JSON-lines logging for every agent run
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,11 @@ _INJECTION_PATTERNS = [
     "new persona",
     "jailbreak",
     "bypass your",
+    # Unauthorized-action patterns (FC-04)
+    "deploy to production",
+    "restart the server",
+    "push to main",
+    "merge to main",
 ]
 
 _MAX_GOAL_CHARS = 2000
@@ -157,10 +164,19 @@ class QAAgent:
             # ACT — run each test case; stop at first Docker-unavailable error
             test_results, docker_error = self._act(test_cases, iteration, trace)
             if docker_error:
+                # FC-05: Draft a minimal issue describing the Docker configuration problem
+                docker_analysis = {
+                    "summary": "Docker daemon is unavailable — tests could not be executed.",
+                    "root_cause": docker_error,
+                    "affected_files": [],
+                    "suggested_fix": "Ensure Docker Desktop is running before starting the agent.",
+                    "confidence": "high",
+                }
+                docker_draft = self._draft(goal, docker_analysis, iteration, trace)
                 result = self._build_result(
                     run_id=run_id, goal=goal, status="error",
                     iterations=iteration, test_results=test_results,
-                    analysis=None, draft=None,
+                    analysis=docker_analysis, draft=docker_draft,
                     handoff_msg=f"Docker unavailable: {docker_error}", trace=trace,
                 )
                 self._save_trace(run_id, goal, trace, started)
@@ -256,6 +272,13 @@ class QAAgent:
               trace: list) -> dict:
         """PLAN — propose test cases using RAG context."""
         plan = call_tool("propose_tests", {"issue_description": goal})
+
+        # Output schema validation
+        schema_error = _validate_tool_output("propose_tests", plan)
+        if schema_error:
+            logger.error("Schema validation failed for propose_tests: %s", schema_error)
+            plan["error"] = schema_error
+
         decision = (
             f"{len(plan.get('test_cases', []))} test case(s) proposed"
             if "error" not in plan
@@ -279,6 +302,13 @@ class QAAgent:
 
         results = call_tool("run_tests", {"test_code": combined_code})
 
+        # Output schema validation
+        schema_error = _validate_tool_output("run_tests", results)
+        if schema_error:
+            logger.error("Schema validation failed for run_tests: %s", schema_error)
+            return {"status": "error", "passed": 0, "failed": 0,
+                    "stdout": "", "stderr": schema_error, "exit_code": -1}, schema_error
+
         # Docker-unavailable is an unrecoverable error — signal it separately
         if results.get("status") == "error" and "Docker is unavailable" in results.get("stderr", ""):
             _record(trace, "ACT", "run_tests",
@@ -299,6 +329,13 @@ class QAAgent:
         if not test_results:
             return {}
         analysis = call_tool("analyze_failures", {"test_results": test_results})
+
+        # Output schema validation
+        schema_error = _validate_tool_output("analyze_failures", analysis)
+        if schema_error:
+            logger.error("Schema validation failed for analyze_failures: %s", schema_error)
+            analysis["error"] = schema_error
+
         _record(trace, "OBSERVE", "analyze_failures",
                 f"stdout={len(test_results.get('stdout', ''))} chars",
                 f"confidence={analysis.get('confidence', '?')} "
@@ -315,6 +352,13 @@ class QAAgent:
             "goal":      goal,
         }
         draft = call_tool("draft_issue", params)
+
+        # Output schema validation
+        schema_error = _validate_tool_output("draft_issue", draft)
+        if schema_error:
+            logger.error("Schema validation failed for draft_issue: %s", schema_error)
+            draft["error"] = schema_error
+
         _record(trace, "DECIDE", "draft_issue", "analysis + goal",
                 f"title={draft.get('title', '')[:60]}",
                 "draft ready for human review")
@@ -375,6 +419,36 @@ class QAAgent:
 def _validate_goal(goal: str) -> Optional[str]:
     """Module-level alias for QAAgent._validate_goal — used by tests."""
     return QAAgent()._validate_goal(goal)
+
+
+# ---------------------------------------------------------------------------
+# Output schema validation
+# ---------------------------------------------------------------------------
+
+_TOOL_OUTPUT_SCHEMAS: dict[str, set[str]] = {
+    "propose_tests":    {"goal", "context_chunks", "test_cases"},
+    "run_tests":        {"status", "passed", "failed", "stdout", "stderr", "exit_code"},
+    "analyze_failures": {"summary", "root_cause", "affected_files", "suggested_fix", "confidence"},
+    "draft_issue":      {"title", "body", "labels", "github_url"},
+}
+
+
+def _validate_tool_output(tool_name: str, output: dict) -> Optional[str]:
+    """Return an error string if *output* is missing required keys, else None.
+
+    Only validates when the output does not already contain an 'error' key
+    (error dicts are intentionally incomplete).
+    """
+    if "error" in output:
+        return None   # error dicts are valid — missing keys are expected
+    required = _TOOL_OUTPUT_SCHEMAS.get(tool_name, set())
+    missing = required - output.keys()
+    if missing:
+        return (
+            f"Tool '{tool_name}' output missing required keys: {sorted(missing)}. "
+            f"Got: {sorted(output.keys())}"
+        )
+    return None
 
 
 def _now() -> str:

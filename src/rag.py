@@ -65,6 +65,7 @@ _COLLECTION_NAME = "qa_agent_corpus"
 # Chunk size limits (characters) — keeps vectors within embedding model limits
 _MAX_CHUNK_CHARS = 6000
 _MIN_CHUNK_CHARS = 40          # ignore trivially small chunks (e.g. blank __init__)
+_MAX_SIMILARITY_DISTANCE = 0.7  # FC-01: filter out low-relevance chunks (cosine distance)
 
 # Module-level ChromaDB client — initialised lazily
 _chroma_client: Optional[chromadb.ClientAPI] = None
@@ -179,6 +180,8 @@ def retrieve(query: str, top_k: int = 5) -> list[dict]:
     distances = results.get("distances", [[]])[0]
 
     for doc, meta, dist in zip(docs, metadatas, distances):
+        if dist > _MAX_SIMILARITY_DISTANCE:
+            continue   # FC-01: filter out low-relevance results
         chunks.append(
             {
                 "text":       doc,
@@ -187,6 +190,14 @@ def retrieve(query: str, top_k: int = 5) -> list[dict]:
                 "chunk_name": meta.get("chunk_name", ""),
                 "score":      round(dist, 6),
             }
+        )
+
+    if not chunks:
+        logger.warning(
+            "All retrieved chunks below similarity threshold (distance > %.2f). "
+            "No relevant context found for query.",
+            _MAX_SIMILARITY_DISTANCE,
+            extra={"event": "rag_no_relevant_context"},
         )
 
     logger.info(

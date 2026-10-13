@@ -1,7 +1,7 @@
 ## Prompt Specification: test_planner
-## Version: 1.1
-## Last updated: 2026-09-14
-## Changelog: Added NEGATIVE EXAMPLE block to prevent markdown fence wrapping (TP-04 failure).
+## Version: 1.2
+## Last updated: 2026-10-16
+## Changelog: Added no-src-import fallback instruction for empty context (FC-03).
 ## Purpose: Generate a structured test plan from a goal description and retrieved code context.
 
 ---
@@ -28,7 +28,10 @@ Each test case must be independently runnable with pytest.
 - Generate between 3 and 8 test cases per plan. Do not pad with trivial duplicates.
 - Each test function must be syntactically valid Python 3.11+ and importable without errors.
 - Do not import modules that are not in the standard library or in: pytest, unittest.mock.
-  Any application code under test must be imported from the `src` package.
+  Any application code under test must be imported from the `src` package — UNLESS the
+  CONTEXT section below is empty or contains only "No relevant context retrieved from
+  the corpus." In that case, generate self-contained tests using only the standard library
+  and unittest.mock.MagicMock. Do not import from src.* when no source context is provided.
 - Tests must not make real network calls, write to disk outside /tmp, or start subprocesses.
   Use unittest.mock.patch or pytest monkeypatch for all external dependencies.
 - Do not include placeholder comments like "# TODO" or "# add assertion here".
