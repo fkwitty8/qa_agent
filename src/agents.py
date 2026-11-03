@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).parent.parent
 _TRACES_DIR   = _PROJECT_ROOT / "evidence" / "traces"
 
-# Prompt injection patterns — reject goals containing these strings
+# Prompt injection patterns for — reject goals containing these strings
 _INJECTION_PATTERNS = [
     "ignore previous instructions",
     "ignore all previous",

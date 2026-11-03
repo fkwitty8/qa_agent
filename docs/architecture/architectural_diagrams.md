@@ -9,7 +9,7 @@ flowchart TD
     UI([User / Streamlit UI]) --> GOAL["goal: str"]
     GOAL --> VAL{"Validate\ngoal"}
     VAL -- "empty / too long\n/ injection" --> ERR1["status = 'error'\nreturn immediately"]
-    VAL -- valid --> SENSE
+      VAL -- valid --> SENSE
 
     subgraph LOOP["🔁 Bounded Loop  —  max MAX_AGENT_ITERATIONS"]
         direction TB
