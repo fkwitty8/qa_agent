@@ -5,7 +5,7 @@
 **Indexed by:** `src/rag.py` — `build_index()`  
 **ChromaDB collection:** `qa_agent_corpus`  
 **Storage path:** `evidence/chroma_db/`  
-**Embedding model:** `models/text-embedding-004` (768-dim, cosine similarity)
+**Embedding model:** `gemini-embedding-001` (3072-dim, cosine similarity)
 
 Provenance metadata stored per chunk: `file_path`, `chunk_type`, `chunk_name`, `last_modified`.  
 Chunk types: `function` | `class` | `section` | `file`  

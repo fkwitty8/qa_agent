@@ -665,10 +665,26 @@ def _fallback_body(analysis: dict, goal: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _format_context(chunks: list[dict]) -> str:
-    """Format RAG chunks into a numbered context block for the prompt."""
+    """Format RAG chunks into a numbered context block for the prompt.
+
+    External codebase chunks (file_path starting with '[') get a prominent
+    header so the test_planner prompt can detect RULE A applies.
+    """
     if not chunks:
         return "No relevant context retrieved from the corpus."
+
+    # Check if any chunks are from an external codebase
+    has_external = any(c.get("file_path", "").startswith("[") for c in chunks)
+
     parts = []
+    if has_external:
+        parts.append(
+            "NOTE: One or more context chunks below are from an EXTERNAL codebase "
+            "(file paths starting with '[label]/'). Apply RULE A from the constraints: "
+            "generate self-contained tests using unittest.mock only. "
+            "Do NOT import from src.*."
+        )
+
     for i, c in enumerate(chunks, 1):
         parts.append(
             f"[{i}] {c['file_path']} ({c['chunk_type']}: {c['chunk_name']})\n"

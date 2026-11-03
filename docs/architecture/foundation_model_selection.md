@@ -3,7 +3,7 @@
 ## Decision Summary
 
 **Selected model:** Gemini 3.8 Flash (`gemini-3.8-flash`)  
-**Embedding model:** `models/text-embedding-004`  
+**Embedding model:** `gemini-embedding-001` (text-only RAG; migrated from `text-embedding-004` which was shut down January 2026)  
 **Provider:** Google AI Studio (free tier)  
 **SDK:** `google-genai` 2.x (`from google import genai`)  
 **Decision date:** 2026-09-14  
@@ -34,7 +34,7 @@
 | Context window | 1 million tokens |
 | Free tier | Yes — Google AI Studio, no credit card required |
 | Function calling | Native, structured JSON output |
-| Embedding model | `text-embedding-004` (768-dim, free tier) |
+| Embedding model | `gemini-embedding-001` (3072-dim, free tier) |
 | Latency (typical) | 500–1500 ms per call |
 | Output format control | `response_mime_type`, `response_schema` via SDK |
 | Data handling | Prompts may be used to improve Google models on free tier |
@@ -118,9 +118,10 @@ Confidence scoring is self-reported; spot-checks confirm "high" confidence corre
 with single-failure, complete-traceback inputs and "low" with truncated or multi-module
 failures. 5/5 manual cases passed on v1.0.
 
-### Embeddings (`text-embedding-004`)
+### Embeddings (`gemini-embedding-001`)
 
-768-dimensional embeddings. Cosine similarity retrieval via ChromaDB gives semantically
+3072-dimensional embeddings by default (supports Matryoshka truncation to 768 or 1536).
+Cosine similarity retrieval via ChromaDB gives semantically
 relevant results for code-related queries (function names, module descriptions). No
 fine-tuning available on the free tier — zero-shot retrieval only.
 

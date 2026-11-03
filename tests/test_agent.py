@@ -125,7 +125,9 @@ def test_run_returns_passed_on_first_success(tmp_path):
 
     assert result["status"] == "passed"
     assert result["iterations"] == 1
-    assert result["draft"] is not None
+    assert result["draft"] is None
+    assert result["pass_summary"] is not None
+    assert "passed" in result["pass_summary"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +366,7 @@ def test_run_draft_issue_never_auto_approved(tmp_path):
 
     def side_effect(name, params):
         if name == "propose_tests":    return PLAN_WITH_TESTS
-        if name == "run_tests":        return RESULTS_PASSED
+        if name == "run_tests":        return RESULTS_FAILED
         if name == "analyze_failures": return ANALYSIS
         if name == "draft_issue":
             draft_calls.append(params)

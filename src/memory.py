@@ -20,6 +20,7 @@ Usage:
 import json
 import logging
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -246,5 +247,161 @@ class MemoryStore:
                 "SELECT * FROM drafted_issues WHERE run_id = ? "
                 "ORDER BY submitted_at DESC",
                 (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# ChatStore — chat conversation persistence
+# ---------------------------------------------------------------------------
+
+_CHAT_DDL = """
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    session_id  TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    message_id  TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES chat_sessions(session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session
+    ON chat_messages(session_id, timestamp);
+"""
+
+
+class ChatStore:
+    """SQLite-backed persistent store for chat conversations.
+
+    Follows the same pattern as MemoryStore: lazy table creation on init,
+    context-managed connections, ISO-8601 UTC timestamps.
+
+    Tables:
+      chat_sessions(session_id, created_at)
+      chat_messages(message_id, session_id, role, content, timestamp)
+    """
+
+    def __init__(self, db_path: Optional[Path] = None) -> None:
+        self.db_path = Path(db_path) if db_path else _DEFAULT_DB_PATH
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self) -> None:
+        """Create chat tables if they don't exist."""
+        with self._conn() as conn:
+            conn.executescript(_CHAT_DDL)
+
+    @contextmanager
+    def _conn(self):
+        """Yield a SQLite connection with row_factory set."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(tz=timezone.utc).isoformat()
+
+    def create_session(self) -> str:
+        """Insert a new chat_sessions row and return its session_id."""
+        session_id = uuid.uuid4().hex[:12]
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO chat_sessions (session_id, created_at) VALUES (?, ?)",
+                (session_id, self._now()),
+            )
+        logger.debug("Created chat session %s", session_id)
+        return session_id
+
+    def session_exists(self, session_id: str) -> bool:
+        """Return True if session_id is present in chat_sessions."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chat_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return row is not None
+
+    def add_message(self, session_id: str, role: str, content: str) -> None:
+        """Append a message to chat_messages.
+
+        Args:
+            session_id: The session to add the message to.
+            role:       Must be "user" or "assistant".
+            content:    The message text.
+
+        Raises:
+            ValueError: If session_id does not exist or role is invalid.
+        """
+        if role not in ("user", "assistant"):
+            raise ValueError(
+                f"Invalid role '{role}'; must be 'user' or 'assistant'."
+            )
+        if not self.session_exists(session_id):
+            raise ValueError(f"Unknown session_id: {session_id}")
+
+        message_id = uuid.uuid4().hex[:12]
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_messages
+                    (message_id, session_id, role, content, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (message_id, session_id, role, content, self._now()),
+            )
+        logger.debug("Added %s message to session %s", role, session_id)
+
+    def get_messages(self, session_id: str) -> list[dict]:
+        """Return all messages for session_id in chronological order.
+
+        Returns [] for an unknown session_id.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, session_id, role, content, timestamp
+                FROM chat_messages
+                WHERE session_id = ?
+                ORDER BY timestamp ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_sessions(self) -> list[dict]:
+        """Return sessions ordered by most recent activity (descending).
+
+        Each dict has keys: session_id, created_at, last_activity, message_count.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.session_id,
+                    s.created_at,
+                    COALESCE(
+                        (SELECT MAX(m.timestamp)
+                         FROM chat_messages m
+                         WHERE m.session_id = s.session_id),
+                        s.created_at
+                    ) AS last_activity,
+                    (SELECT COUNT(*)
+                     FROM chat_messages m
+                     WHERE m.session_id = s.session_id) AS message_count
+                FROM chat_sessions s
+                ORDER BY last_activity DESC
+                """,
             ).fetchall()
         return [dict(r) for r in rows]

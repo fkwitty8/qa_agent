@@ -9,7 +9,7 @@ flowchart TD
     UI([User / Streamlit UI]) --> GOAL["goal: str"]
     GOAL --> VAL{"Validate\ngoal"}
     VAL -- "empty / too long\n/ injection" --> ERR1["status = 'error'\nreturn immediately"]
-      VAL -- valid --> SENSE
+    VAL -- valid --> SENSE
 
     subgraph LOOP["🔁 Bounded Loop  —  max MAX_AGENT_ITERATIONS"]
         direction TB
@@ -64,13 +64,13 @@ flowchart TD
         CRAWL --> MD["Markdown Chunker\n_chunk_markdown()\nHeading sections / file fallback"]
 
         PY & MD --> META["Provenance Metadata\nfile_path · chunk_type\nchunk_name · last_modified"]
-        META --> EMBED1["Gemini Embeddings\ntext-embedding-004\n768-dim vector"]
+        META --> EMBED1["Gemini Embeddings\ngemini-embedding-001\n3072-dim vector"]
         EMBED1 --> UPSERT["ChromaDB Upsert\nDeterministic SHA-256 ID\nevidence/chroma_db/"]
     end
 
     subgraph RETRIEVE["🔍 Retrieval  —  retrieve(query, top_k)"]
         direction TB
-        QUERY["Natural-language Query"] --> EMBED2["Gemini Embeddings\ntext-embedding-004\n768-dim vector"]
+        QUERY["Natural-language Query"] --> EMBED2["Gemini Embeddings\ngemini-embedding-001\n3072-dim vector"]
         EMBED2 --> SEARCH["ChromaDB Query\nCosine Similarity\nHNSW index"]
         SEARCH --> RANK["Ranked Chunks\nscore · file_path\nchunk_type · chunk_name · text"]
         RANK --> GUARD{"Collection\nempty?"}

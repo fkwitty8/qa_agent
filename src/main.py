@@ -32,8 +32,9 @@ from dotenv import load_dotenv
 
 from src.agents import QAAgent
 from src.memory import MemoryStore
-from src.rag import build_index, _get_collection
+from src.rag import build_index, _get_collection, index_external_codebase, list_indexed_codebases
 from src.tools import call_tool
+from src import llm_client
 
 load_dotenv()
 
@@ -73,6 +74,10 @@ if "selected_run_id" not in st.session_state:
     st.session_state.selected_run_id = None
 if "page" not in st.session_state:
     st.session_state.page = "new_run"
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []   # list of {"role": "user"|"assistant", "content": str}
+if "chat_session_id" not in st.session_state:
+    st.session_state.chat_session_id = None
 
 # ---------------------------------------------------------------------------
 # Shared memory store (one instance per session)
@@ -80,6 +85,12 @@ if "page" not in st.session_state:
 @st.cache_resource
 def get_memory() -> MemoryStore:
     return MemoryStore()
+
+
+@st.cache_resource
+def get_chat_store():
+    from src.memory import ChatStore
+    return ChatStore()
 
 
 mem = get_memory()
@@ -99,6 +110,9 @@ with st.sidebar:
     if st.button("📋 Past Runs", use_container_width=True):
         st.session_state.page = "past_runs"
 
+    if st.button("💬 Chat", use_container_width=True):
+        st.session_state.page = "chat"
+
     st.divider()
     st.subheader("Recent Runs")
 
@@ -106,43 +120,121 @@ with st.sidebar:
     if not past_runs:
         st.caption("No runs yet.")
     else:
-        for run in past_runs[:10]:
-            status_icon = {
-                "passed":  "✅",
-                "handoff": "⚠️",
-                "error":   "❌",
-                "failed":  "❌",
-            }.get(run["status"], "⏳")
+        recent = past_runs[:10]
+        options = [r["run_id"] for r in recent]
 
-            label = f"{status_icon} {run['goal'][:35]}…" if len(run["goal"]) > 35 else f"{status_icon} {run['goal']}"
-            if st.button(label, key=f"hist_{run['run_id']}", use_container_width=True):
-                st.session_state.selected_run_id = run["run_id"]
-                full = mem.get_run(run["run_id"])
-                if full:
-                    # Reconstruct a display-compatible result dict from stored data
-                    st.session_state.current_run = {
-                        "run_id":      full["run_id"],
-                        "goal":        full["goal"],
-                        "status":      full["status"],
-                        "trace":       full["trace"],
-                        "iterations":  None,
-                        "test_results": None,
-                        "analysis":    None,
-                        "draft":       None,
-                        "handoff_msg": None,
+        def _run_label(rid: str) -> str:
+            r = next((x for x in recent if x["run_id"] == rid), None)
+            if r is None:
+                return rid
+            icon = {"passed": "✅", "handoff": "⚠️",
+                    "error": "❌", "failed": "❌"}.get(r["status"], "⏳")
+            goal = r["goal"]
+            goal_short = f"{goal[:35]}…" if len(goal) > 35 else goal
+            return f"{icon} {goal_short}"
+
+        def _load_recent_run():
+            rid = st.session_state.get("recent_runs_select")
+            if not rid:
+                return
+            full = mem.get_run(rid)
+            if full:
+                drafts = mem.get_drafts_for_run(rid)
+                draft = None
+                if drafts:
+                    d = drafts[0]
+                    draft = {
+                        "title":      d["title"],
+                        "body":       d["body"],
+                        "labels":     ["bug", "qa-agent"],
+                        "github_url": d["github_url"],
+                        "_issue_id":  d["issue_id"],
                     }
-                    # Restore draft if available
-                    drafts = mem.get_drafts_for_run(run["run_id"])
-                    if drafts:
-                        d = drafts[0]
-                        st.session_state.current_run["draft"] = {
-                            "title":      d["title"],
-                            "body":       d["body"],
-                            "labels":     ["bug", "qa-agent"],
-                            "github_url": d["github_url"],
-                        }
+                st.session_state.current_run = {
+                    "run_id":      full["run_id"],
+                    "goal":        full["goal"],
+                    "status":      full["status"],
+                    "trace":       full["trace"],
+                    "iterations":  None,
+                    "test_results": None,
+                    "analysis":    None,
+                    "draft":       draft,
+                    "handoff_msg": None,
+                }
+                st.session_state.selected_run_id = rid
                 st.session_state.page = "new_run"
+
+        st.selectbox(
+            "Load a run",
+            options,
+            format_func=_run_label,
+            index=None,
+            key="recent_runs_select",
+            placeholder="Load a past run…",
+            on_change=_load_recent_run,
+        )
+
+    # ── External Codebase ─────────────────────────────────────────
+    st.divider()
+    st.subheader("🗂 External Codebase")
+    st.caption("Index another project's code so the agent can generate tests for it.")
+
+    ext_path = st.text_input(
+        "Folder path",
+        placeholder="C:/path/to/other-project",
+        key="ext_codebase_path",
+        help="Absolute path to the root folder of the external codebase.",
+    )
+    ext_label = st.text_input(
+        "Label (optional)",
+        placeholder="meeting-planner",
+        key="ext_codebase_label",
+        help="Short name shown in retrieval results. Defaults to the folder name.",
+    )
+    ext_exts = st.text_input(
+        "Extensions (optional)",
+        placeholder=".java .py .md",
+        key="ext_codebase_exts",
+        help="Space-separated extensions to index. Default: .py .java .js .ts .md .txt",
+    )
+
+    # Display one-shot confirmation after auto-clear
+    if "_index_confirmation" in st.session_state:
+        st.success(st.session_state.pop("_index_confirmation"))
+
+    if st.button("📥 Index Codebase", use_container_width=True,
+                 disabled=not ext_path.strip()):
+        with st.spinner(f"Indexing {ext_path}…"):
+            try:
+                exts = (
+                    [e if e.startswith(".") else f".{e}"
+                     for e in ext_exts.split()]
+                    if ext_exts.strip() else None
+                )
+                label_used = ext_label.strip() or Path(ext_path.strip()).name
+                n = index_external_codebase(
+                    root=ext_path.strip(),
+                    label=ext_label.strip() or None,
+                    extensions=exts,
+                )
+                # Success: clear fields, stash confirmation across rerun
+                for key in ("ext_codebase_path", "ext_codebase_label", "ext_codebase_exts"):
+                    st.session_state.pop(key, None)
+                st.session_state["_index_confirmation"] = (
+                    f"✅ Indexed {n} chunks from '{label_used}'."
+                )
                 st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Indexing failed: {exc}")
+
+    # Show which codebases are currently indexed
+    indexed = list_indexed_codebases()
+    if indexed:
+        st.caption("Currently indexed:")
+        for cb in indexed:
+            st.caption(f"  • {cb}")
 
 # ---------------------------------------------------------------------------
 # Main content
@@ -176,8 +268,8 @@ if st.session_state.page == "new_run":
             _original_record = _agents_mod._record
             steps_so_far = []
 
-            def _live_record(trace, step, tool, inp, out, dec):
-                _original_record(trace, step, tool, inp, out, dec)
+            def _live_record(trace, step, tool, inp, out, dec, extra=None):
+                _original_record(trace, step, tool, inp, out, dec, extra=extra)
                 steps_so_far.append(f"**{step}** › {tool or '—'}: {dec}")
                 progress_placeholder.markdown("\n\n".join(steps_so_far))
 
@@ -252,6 +344,19 @@ if st.session_state.page == "new_run":
                         st.markdown(f"**Output:** {step.get('output_summary', '')}")
                         st.markdown(f"**Decision:** {step.get('decision', '')}")
                         st.caption(step.get("timestamp_utc", ""))
+
+                        # Show test cases inline for PLAN steps
+                        test_cases = step.get("test_cases", [])
+                        if test_cases:
+                            st.markdown("**Proposed test cases:**")
+                            for tc in test_cases:
+                                with st.expander(
+                                    f"`{tc.get('name', '?')}` — {tc.get('type', '')}",
+                                    expanded=False,
+                                ):
+                                    st.caption(tc.get("description", ""))
+                                    if tc.get("code"):
+                                        st.code(tc["code"], language="python")
             else:
                 st.caption("No trace steps recorded.")
 
@@ -260,42 +365,46 @@ if st.session_state.page == "new_run":
 
         # --- Issue draft + approval ---
         with col2:
-            st.subheader("Issue Draft")
-            draft = run.get("draft")
-            if draft and draft.get("title"):
-                st.markdown(f"**{draft['title']}**")
-                st.markdown("---")
-                st.markdown(draft["body"])
-
-                if draft.get("github_url"):
-                    st.success(f"Posted: [{draft['github_url']}]({draft['github_url']})")
-                else:
-                    with st.form("approve_form"):
-                        st.caption("Review the draft above before submitting.")
-                        submitted = st.form_submit_button(
-                            "Submit to GitHub", type="primary"
-                        )
-                        if submitted:
-                            with st.spinner("Posting to GitHub…"):
-                                post_result = call_tool(
-                                    "draft_issue",
-                                    {
-                                        "analysis":  run.get("analysis") or {},
-                                        "approved":  True,
-                                        "goal":      run["goal"],
-                                    },
-                                )
-                            if post_result.get("github_url"):
-                                st.success(f"Posted: [{post_result['github_url']}]({post_result['github_url']})")
-                                # Update memory with URL
-                                issue_id = draft.get("_issue_id")
-                                if issue_id:
-                                    mem.update_draft_url(issue_id, post_result["github_url"])
-                                st.session_state.current_run["draft"]["github_url"] = post_result["github_url"]
-                            else:
-                                st.error(f"Post failed: {post_result.get('error', 'Unknown error')}")
+            if run.get("pass_summary"):
+                st.subheader("Outcome")
+                st.success(run["pass_summary"])
             else:
-                st.caption("No draft generated for this run.")
+                st.subheader("Issue Draft")
+                draft = run.get("draft")
+                if draft and draft.get("title"):
+                    st.markdown(f"**{draft['title']}**")
+                    st.markdown("---")
+                    st.markdown(draft["body"])
+
+                    if draft.get("github_url"):
+                        st.success(f"Posted: [{draft['github_url']}]({draft['github_url']})")
+                    else:
+                        with st.form("approve_form"):
+                            st.caption("Review the draft above before submitting.")
+                            submitted = st.form_submit_button(
+                                "Submit to GitHub", type="primary"
+                            )
+                            if submitted:
+                                with st.spinner("Posting to GitHub…"):
+                                    post_result = call_tool(
+                                        "draft_issue",
+                                        {
+                                            "analysis":  run.get("analysis") or {},
+                                            "approved":  True,
+                                            "goal":      run["goal"],
+                                        },
+                                    )
+                                if post_result.get("github_url"):
+                                    st.success(f"Posted: [{post_result['github_url']}]({post_result['github_url']})")
+                                    # Update memory with URL
+                                    issue_id = draft.get("_issue_id")
+                                    if issue_id:
+                                        mem.update_draft_url(issue_id, post_result["github_url"])
+                                    st.session_state.current_run["draft"]["github_url"] = post_result["github_url"]
+                                else:
+                                    st.error(f"Post failed: {post_result.get('error', 'Unknown error')}")
+                else:
+                    st.caption("No draft generated for this run.")
 
 # ---------------------------------------------------------------------------
 # Past Runs page
@@ -352,3 +461,161 @@ elif st.session_state.page == "past_runs":
                 }
                 st.session_state.page = "new_run"
                 st.rerun()
+
+# ---------------------------------------------------------------------------
+# Chat page
+# ---------------------------------------------------------------------------
+
+_CHAT_SYSTEM_PROMPT = """You are a helpful assistant for the SE QA Agent — a \
+bounded, agentic software quality tool built as a university capstone project.
+
+You know everything about this system:
+
+WHAT IT DOES:
+The SE QA Agent helps software developers automatically generate pytest tests, \
+run them in a Docker sandbox, analyse failures with AI, and draft GitHub issues \
+for human review. The developer always approves before anything is posted.
+
+THE FIVE LAYERS:
+1. Model — Gemini 3.8 Flash (Google AI Studio, free tier) via llm_client.py
+2. Prompts — Three versioned prompt files: test_planner, failure_analyzer, issue_drafter
+3. RAG — ChromaDB vector store; the agent indexes its own codebase (and any external \
+   codebase the user provides) and retrieves relevant code chunks before generating tests
+4. Tools — Four safe, allow-listed tools: propose_tests, run_tests, analyze_failures, draft_issue
+5. Agent loop — Bounded SENSE→PLAN→ACT→OBSERVE→DECIDE loop, max 3 iterations by default
+
+THE WORKFLOW (when a user enters a goal):
+SENSE: retrieve relevant code chunks from ChromaDB
+PLAN: call Gemini with the test_planner prompt → get pytest test cases as JSON
+ACT: run the test code inside a python:3.11-slim Docker container
+OBSERVE: if tests fail, call Gemini with failure_analyzer prompt → root-cause analysis
+DECIDE: if all pass or limit reached → call issue_drafter → draft GitHub issue (not posted yet)
+The developer then reviews the draft and clicks "Submit to GitHub" to approve posting.
+
+GUARDRAILS:
+- Input validation: rejects goals >2000 chars, prompt injection patterns, deployment commands
+- Tool allow-list: only 4 tools permitted; any other tool name is rejected immediately
+- Syntax gate: test code is validated with ast.parse() before Docker starts
+- Docker sandbox: test file mounted read-only; no host filesystem access; always cleaned up
+- Output schema validation: tool outputs checked for required keys after every call
+- Human approval gate: draft_issue always defaults to approved=False; GitHub API never called automatically
+- Iteration hard cap: loop condition cannot be bypassed by tool output
+
+EXTERNAL CODEBASES:
+The user can index any external project (Java, Python, JS, etc.) via the sidebar. \
+The agent retrieves chunks from it and generates self-contained mocked tests \
+(since external code cannot be imported inside the Docker sandbox).
+
+MEMORY:
+Run history is stored in SQLite at evidence/qa_agent.db. \
+The Streamlit sidebar shows the last 10 runs with status icons. \
+Past runs can be clicked to restore their trace and draft.
+
+TECH STACK:
+Python 3.11, Gemini 3.8 Flash, gemini-embedding-001, ChromaDB, Docker, \
+Streamlit, SQLite, PyGithub, pytest.
+
+Be concise and helpful. If the user asks how to do something in the system, \
+give them practical step-by-step guidance. If they ask a general AI or \
+software engineering question, answer that too. Always be honest about \
+limitations — for example, the agent cannot directly run Java tests, and \
+it requires Docker Desktop to be running for test execution."""
+
+
+if st.session_state.page == "chat":
+    chat_store = get_chat_store()
+    st.header("💬 Chat with the QA Agent")
+    st.caption("Ask anything about the system, how to use it, or general software engineering questions.")
+
+    # Session controls
+    col_new, col_clear = st.columns([1, 1])
+    if col_new.button("＋ New chat", use_container_width=True):
+        st.session_state.chat_session_id = None
+        st.session_state.chat_history = []
+        st.rerun()
+
+    # Past sessions selector
+    sessions = chat_store.list_sessions()
+    if sessions:
+        options = [s["session_id"] for s in sessions]
+
+        def _session_label(sid):
+            s = next((x for x in sessions if x["session_id"] == sid), None)
+            if s is None:
+                return sid
+            msgs = chat_store.get_messages(sid)
+            first_user = next((m["content"] for m in msgs if m["role"] == "user"), "")
+            preview = f"{first_user[:40]}…" if len(first_user) > 40 else first_user
+            return f"{preview} · {s['message_count']} msg(s)"
+
+        selected = st.selectbox("Past conversations", options,
+                                format_func=_session_label,
+                                index=None,
+                                placeholder="Continue a past conversation…")
+        if selected and selected != st.session_state.chat_session_id:
+            msgs = chat_store.get_messages(selected)
+            st.session_state.chat_history = [
+                {"role": m["role"], "content": m["content"]} for m in msgs
+            ]
+            st.session_state.chat_session_id = selected
+
+    if col_clear.button("🗑 Clear chat", use_container_width=True,
+                        disabled=not st.session_state.chat_history):
+        st.session_state.chat_session_id = None
+        st.session_state.chat_history = []
+        st.rerun()
+
+    # Display chat history
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat input
+    user_input = st.chat_input("Ask a question…")
+
+    if user_input:
+        # Ensure an active session exists (lazy creation)
+        if st.session_state.chat_session_id is None:
+            st.session_state.chat_session_id = chat_store.create_session()
+        sid = st.session_state.chat_session_id
+
+        # Add user message to history and persist
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        try:
+            chat_store.add_message(sid, "user", user_input)
+        except Exception:
+            pass
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # Build conversation context for Gemini
+        history_window = st.session_state.chat_history[-20:]
+        conversation_prompt = "\n\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+            for m in history_window[:-1]
+        )
+        if conversation_prompt:
+            full_prompt = f"{conversation_prompt}\n\nUser: {user_input}"
+        else:
+            full_prompt = user_input
+
+        # Call Gemini
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    response = llm_client.generate(
+                        prompt=full_prompt,
+                        system_prompt=_CHAT_SYSTEM_PROMPT,
+                        temperature=0.5,
+                    )
+                except Exception as exc:
+                    response = f"Sorry, I couldn't get a response right now. Error: {exc}"
+
+            st.markdown(response)
+
+        # Store assistant reply
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+        try:
+            chat_store.add_message(sid, "assistant", response)
+        except Exception:
+            pass

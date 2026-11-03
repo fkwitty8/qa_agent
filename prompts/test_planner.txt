@@ -1,7 +1,7 @@
 ## Prompt Specification: test_planner
-## Version: 1.2
-## Last updated: 2026-10-16
-## Changelog: Added no-src-import fallback instruction for empty context (FC-03).
+## Version: 1.3
+## Last updated: 2026-10-22
+## Changelog: Added external codebase self-contained test rule (FC-06).
 ## Purpose: Generate a structured test plan from a goal description and retrieved code context.
 
 ---
@@ -28,10 +28,21 @@ Each test case must be independently runnable with pytest.
 - Generate between 3 and 8 test cases per plan. Do not pad with trivial duplicates.
 - Each test function must be syntactically valid Python 3.11+ and importable without errors.
 - Do not import modules that are not in the standard library or in: pytest, unittest.mock.
-  Any application code under test must be imported from the `src` package — UNLESS the
-  CONTEXT section below is empty or contains only "No relevant context retrieved from
-  the corpus." In that case, generate self-contained tests using only the standard library
-  and unittest.mock.MagicMock. Do not import from src.* when no source context is provided.
+  Apply these rules in order:
+
+  RULE A — External codebase context: If ANY file path in the CONTEXT section starts with
+  "[" (e.g. "[meeting-planner]/src/app.py"), the code under test is NOT importable inside
+  the test sandbox. Generate self-contained tests using only the standard library and
+  unittest.mock.MagicMock. Do NOT write "from src.X import Y" or "import src.X". Instead,
+  mock the module under test completely using MagicMock, then assert on the mock's behaviour.
+  Example: `app = MagicMock(); app.get_user.return_value = {"id": 1}; assert app.get_user(1)["id"] == 1`
+
+  RULE B — Empty context: If the CONTEXT section is empty or contains only
+  "No relevant context retrieved from the corpus.", generate self-contained tests
+  using only the standard library and unittest.mock.MagicMock. Do not import from src.*.
+
+  RULE C — Own codebase context (default): If the CONTEXT section contains file paths
+  that do NOT start with "[", import application code from the `src` package as normal.
 - Tests must not make real network calls, write to disk outside /tmp, or start subprocesses.
   Use unittest.mock.patch or pytest monkeypatch for all external dependencies.
 - Do not include placeholder comments like "# TODO" or "# add assertion here".

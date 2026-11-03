@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).parent.parent
 _TRACES_DIR   = _PROJECT_ROOT / "evidence" / "traces"
 
-# Prompt injection patterns for — reject goals containing these strings
+# Prompt injection patterns — reject goals containing these strings
 _INJECTION_PATTERNS = [
     "ignore previous instructions",
     "ignore all previous",
@@ -144,11 +144,23 @@ class QAAgent:
             # PLAN
             plan = self._plan(goal, context_chunks, iteration, trace)
             if "error" in plan:
-                # LLM or RAG failure — surface as error, stop loop
+                plan_error = plan["error"]
+                if iteration < self.max_iterations:
+                    # Transient LLM/RAG failure — retry if iterations remain
+                    logger.warning(
+                        "Planning failed on iteration %d/%d, retrying: %s",
+                        iteration, self.max_iterations, plan_error[:120],
+                        extra={"event": "plan_retry", "run_id": run_id,
+                               "iteration": iteration, "error": plan_error},
+                    )
+                    _record(trace, "PLAN", "propose_tests", goal[:80],
+                            f"error: {plan_error[:80]}", "retry")
+                    continue
+                # Final iteration — surface as error
                 result = self._build_result(
                     run_id=run_id, goal=goal, status="error",
                     iterations=iteration, test_results=None, analysis=None,
-                    draft=None, handoff_msg=f"Planning failed: {plan['error']}", trace=trace,
+                    draft=None, handoff_msg=f"Planning failed: {plan_error}", trace=trace,
                 )
                 self._save_trace(run_id, goal, trace, started)
                 return result
@@ -184,11 +196,16 @@ class QAAgent:
 
             # DECIDE after ACT — did everything pass?
             if test_results and test_results.get("status") == "passed":
-                draft = self._draft(goal, None, iteration, trace)
+                pass_summary = _build_pass_summary(test_results, iteration)
+                _record(trace, "DECIDE", None,
+                        f"iteration {iteration}",
+                        pass_summary,
+                        "all tests passed — summary generated, no issue drafted")
                 result = self._build_result(
                     run_id=run_id, goal=goal, status="passed",
                     iterations=iteration, test_results=test_results,
-                    analysis=None, draft=draft, handoff_msg=None, trace=trace,
+                    analysis=None, draft=None, handoff_msg=None, trace=trace,
+                    pass_summary=pass_summary,
                 )
                 self._save_trace(run_id, goal, trace, started)
                 return result
@@ -279,13 +296,25 @@ class QAAgent:
             logger.error("Schema validation failed for propose_tests: %s", schema_error)
             plan["error"] = schema_error
 
+        test_cases = plan.get("test_cases", [])
+        has_error   = "error" in plan
+
         decision = (
-            f"{len(plan.get('test_cases', []))} test case(s) proposed"
-            if "error" not in plan
+            f"{len(test_cases)} test case(s) proposed"
+            if not has_error
             else f"planning error: {plan['error'][:80]}"
         )
+
+        # Store test case names + code in the trace so they are always retrievable
+        test_case_summary = [
+            {"name": tc.get("name", ""), "type": tc.get("type", ""),
+             "description": tc.get("description", ""), "code": tc.get("code", "")}
+            for tc in test_cases
+        ] if test_cases else []
+
         _record(trace, "PLAN", "propose_tests", goal[:80],
-                f"test_cases={len(plan.get('test_cases', []))}", decision)
+                f"test_cases={len(test_cases)}", decision,
+                extra={"test_cases": test_case_summary})
         return plan
 
     def _act(self, test_cases: list, iteration: int,
@@ -328,6 +357,16 @@ class QAAgent:
         """OBSERVE — analyse failures with Gemini."""
         if not test_results:
             return {}
+
+        # Short-circuit obvious syntax/import errors without LLM
+        obvious = _detect_obvious_error(test_results)
+        if obvious is not None:
+            _record(trace, "OBSERVE", "analyze_failures (skipped — obvious error)",
+                    f"stdout={len(test_results.get('stdout', ''))} chars",
+                    f"root_cause={obvious['root_cause'][:80]}",
+                    "skip LLM, root cause recorded")
+            return obvious
+
         analysis = call_tool("analyze_failures", {"test_results": test_results})
 
         # Output schema validation
@@ -398,6 +437,7 @@ class QAAgent:
         run_id: str, goal: str, status: str, iterations: int,
         test_results: Optional[dict], analysis: Optional[dict],
         draft: Optional[dict], handoff_msg: Optional[str], trace: list,
+        pass_summary: Optional[str] = None,
     ) -> dict:
         return {
             "run_id":       run_id,
@@ -409,6 +449,7 @@ class QAAgent:
             "draft":        draft,
             "handoff_msg":  handoff_msg,
             "trace":        trace,
+            "pass_summary": pass_summary,
         }
 
 
@@ -457,13 +498,84 @@ def _now() -> str:
 
 
 def _record(trace: list, step: str, tool: Optional[str],
-            input_summary: str, output_summary: str, decision: str) -> None:
+            input_summary: str, output_summary: str, decision: str,
+            extra: dict | None = None) -> None:
     """Append a step record to *trace*."""
-    trace.append({
+    entry = {
         "step":           step,
         "tool":           tool,
         "input_summary":  input_summary,
         "output_summary": output_summary,
         "decision":       decision,
         "timestamp_utc":  _now(),
-    })
+    }
+    if extra:
+        entry.update(extra)
+    trace.append(entry)
+
+
+# ---------------------------------------------------------------------------
+# Obvious-error detection and pass-summary helpers
+# ---------------------------------------------------------------------------
+
+_OBVIOUS_ERROR_PATTERNS: list[tuple[str, str, str]] = [
+    # (substring to match, human label, suggested fix)
+    ("SyntaxError", "syntax error",
+     "Fix the syntax error reported in the test code."),
+    ("ModuleNotFoundError", "import error",
+     "Ensure the imported module is available; use unittest.mock "
+     "for external dependencies."),
+    ("ImportError", "import error",
+     "Ensure the imported module is available; use unittest.mock "
+     "for external dependencies."),
+]
+
+
+def _extract_error_line(text: str, pattern: str) -> str:
+    """Return the first line containing *pattern*, truncated to 200 chars."""
+    for line in text.splitlines():
+        if pattern in line:
+            return line[:200]
+    return pattern  # fallback: return the pattern itself
+
+
+def _detect_obvious_error(test_results: Optional[dict]) -> Optional[dict]:
+    """Return a minimal analysis dict for obvious syntax/import failures.
+
+    Returns None when:
+      - test_results is None/empty, or
+      - the run did not fail (status != "failed"), or
+      - no obvious-error pattern is present (i.e. assertion/runtime errors).
+
+    The returned dict is schema-compatible with analyze_failures output.
+    """
+    if not test_results:
+        return None
+    if test_results.get("status") != "failed":
+        return None
+
+    combined = (
+        test_results.get("stdout", "") + "\n" + test_results.get("stderr", "")
+    )
+    for pattern, label, suggested_fix in _OBVIOUS_ERROR_PATTERNS:
+        if pattern in combined:
+            return {
+                "summary": f"Test failure caused by a {label}.",
+                "root_cause": _extract_error_line(combined, pattern),
+                "affected_files": [],
+                "suggested_fix": suggested_fix,
+                "confidence": "high",
+                "skipped_llm": True,
+            }
+    return None
+
+
+def _build_pass_summary(test_results: Optional[dict], iteration: int) -> str:
+    """Return a one-line summary note for an all-pass run.
+
+    Example: 'All 3 test(s) passed in 1 iteration(s).'
+    """
+    passed = 0
+    if test_results:
+        passed = test_results.get("passed", 0) or 0
+    return f"All {passed} test(s) passed in {iteration} iteration(s)."
