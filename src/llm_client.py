@@ -20,6 +20,12 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+try:
+    from groq import Groq
+    _GROQ_AVAILABLE = True
+except ImportError:
+    _GROQ_AVAILABLE = False
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -58,6 +64,26 @@ def _get_client() -> genai.Client:
         _client = genai.Client(api_key=api_key)
         logger.debug("Gemini client initialised.")
     return _client
+
+
+# ---------------------------------------------------------------------------
+# Groq client (cross-provider fallback)
+# ---------------------------------------------------------------------------
+_groq_client: Optional["Groq"] = None
+
+
+def _get_groq_client() -> Optional["Groq"]:
+    """Return the Groq client, or None if not configured."""
+    global _groq_client
+    if not _GROQ_AVAILABLE:
+        return None
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_key:
+        return None
+    if _groq_client is None:
+        _groq_client = Groq(api_key=groq_key)
+        logger.debug("Groq client initialised.")
+    return _groq_client
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +204,10 @@ def generate(
                     ) from exc
 
                 is_transient = _is_transient_error(exc_str)
+                is_model_not_found = (
+                    "404" in exc_str or "NOT_FOUND" in exc_str
+                    or "no longer available" in exc_str
+                )
                 retries_left = _max_retries - (attempt - 1)
 
                 if is_transient and retries_left > 0:
@@ -199,11 +229,13 @@ def generate(
                     time.sleep(delay)
                     continue  # retry same model
 
-                # Retries exhausted or non-transient error
-                if is_transient and not is_last_model:
+                # Retries exhausted (transient) or model deprecated (404)
+                should_fallback = (is_transient or is_model_not_found) and not is_last_model
+                if should_fallback:
                     logger.warning(
-                        "Model %s exhausted %d retries, falling back to %s",
-                        current_model, _max_retries + 1,
+                        "Model %s unavailable (%s), falling back to %s",
+                        current_model,
+                        "retries exhausted" if is_transient else "model not found",
                         model_chain[chain_idx + 1],
                         extra={
                             "event": "llm_call_fallback",
@@ -233,11 +265,15 @@ def generate(
         if response is not None:
             break
 
-    # Safety net: all models exhausted without a response
+    # Safety net: all Gemini models exhausted — try Groq as cross-provider fallback
     if response is None:
+        groq_text = _generate_groq(prompt, system_prompt, temperature, t0, prompt_hash)
+        if groq_text is not None:
+            return groq_text
+
         latency_ms = int((time.monotonic() - t0) * 1000)
         logger.error(
-            "LLM call failed — all models in chain exhausted",
+            "LLM call failed — all providers exhausted",
             extra={
                 "event": "llm_call_error",
                 "model": primary_model,
@@ -248,8 +284,8 @@ def generate(
             },
         )
         raise RuntimeError(
-            f"Gemini API call failed after trying {len(model_chain)} "
-            f"model(s): {last_exc}"
+            f"LLM call failed after trying {len(model_chain)} Gemini model(s) "
+            f"and Groq fallback: {last_exc}"
         ) from last_exc
 
     latency_ms = int((time.monotonic() - t0) * 1000)
@@ -289,6 +325,82 @@ def generate(
     )
 
     return text
+
+
+def _generate_groq(
+    prompt: str,
+    system_prompt: Optional[str],
+    temperature: float,
+    t0: float,
+    prompt_hash: str,
+) -> Optional[str]:
+    """Try generating a response using Groq as a cross-provider fallback.
+
+    Returns the response text, or None if Groq is not configured or fails.
+    """
+    groq_client = _get_groq_client()
+    if groq_client is None:
+        return None
+
+    groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    messages: list = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    logger.info(
+        "Falling back to Groq (%s) after all Gemini models failed",
+        groq_model,
+        extra={
+            "event": "llm_call_fallback",
+            "model": groq_model,
+            "previous_model": "gemini (all exhausted)",
+            "prompt_hash": prompt_hash,
+        },
+    )
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=groq_model,
+            messages=messages,
+            temperature=temperature,
+        )
+        text = response.choices[0].message.content
+        if not text or not text.strip():
+            logger.warning("Groq returned an empty response.")
+            return None
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        output_tokens = getattr(usage, "completion_tokens", None) if usage else None
+
+        logger.info(
+            "LLM call complete (Groq)",
+            extra={
+                "event": "llm_call_complete",
+                "model": groq_model,
+                "prompt_hash": prompt_hash,
+                "response_hash": _hash(text),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "latency_ms": latency_ms,
+            },
+        )
+        return text
+    except Exception as exc:
+        logger.warning(
+            "Groq fallback failed: %s",
+            exc,
+            extra={
+                "event": "llm_call_error",
+                "model": groq_model,
+                "prompt_hash": prompt_hash,
+                "error": str(exc),
+            },
+        )
+        return None
 
 
 def embed(text: str, model: Optional[str] = None) -> list[float]:
