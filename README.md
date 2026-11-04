@@ -14,7 +14,7 @@ Built as a BSE4104 capstone project over 8 weeks.
 
 - Python 3.11+
 - Docker Desktop (running) — used for sandboxed test execution
-- A [Google AI Studio](https://aistudio.google.com/app/apikey) account (free tier)
+- A [Google AI Studio](https://aistudio.google.com/app/apikey) account (free tier) **or** a [GroqCloud](https://console.groq.com/keys) API key
 - A GitHub personal access token with `repo` scope (issues read/write)
 
 ### 2. Clone and configure
@@ -30,10 +30,24 @@ cp .env.example .env
 Open `.env` and set at minimum:
 
 ```
+# Option A: Gemini as primary LLM (with Groq fallback on rate-limit errors)
 GEMINI_API_KEY=your_key_here
+GROQ_API_KEY=your_groq_key_here
+
+# Option B: Groq as sole LLM (comment out GEMINI_API_KEY)
+#GEMINI_API_KEY=
+GROQ_API_KEY=your_groq_key_here
+GROQ_MODEL=openai/gpt-oss-120b
+
 GITHUB_TOKEN=your_token_here
 GITHUB_REPO=your_username/your_repo
 ```
+
+> **Note:** RAG uses Gemini embeddings when `GEMINI_API_KEY` is set, or a
+> local model (all-MiniLM-L6-v2, bundled with ChromaDB) when running Groq-only.
+> If you switch providers, delete the `evidence/chroma_db` directory and
+> re-run `build_index()` to re-index with the new embedding dimensions.
+> See `.env.example` for all options including fallback model chains.
 
 ### 3. Install dependencies
 
@@ -74,7 +88,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 ```
 .
 ├── src/
-│   ├── llm_client.py       # Gemini API wrapper with logging
+│   ├── llm_client.py       # LLM wrapper (Gemini primary, Groq fallback/primary)
 │   ├── prompt_loader.py    # Load and version prompts from disk
 │   ├── rag.py              # ChromaDB ingestion and retrieval
 │   ├── tools.py            # All four tool implementations
@@ -111,9 +125,9 @@ pytest tests/ --cov=src --cov-report=term-missing
 flowchart TD
     UI[Streamlit UI] --> Agent
     Agent --> RAG[RAG Retriever\nChromaDB]
-    Agent --> Planner[Test Planner Tool\nGemini]
+    Agent --> Planner[Test Planner Tool\nLLM]
     Agent --> Executor[Test Executor Tool\nDocker Sandbox]
-    Agent --> Analyzer[Failure Analyzer Tool\nGemini]
+    Agent --> Analyzer[Failure Analyzer Tool\nLLM]
     Agent --> Issuer[Issue Drafter Tool\nGitHub API]
     Agent --> Memory[Persistent Memory\nSQLite]
     RAG --> Corpus[Codebase + Docs\n.py .md files]
@@ -125,9 +139,9 @@ flowchart TD
 
 ```
 SENSE   → retrieve relevant code/docs via RAG
-PLAN    → generate test plan (Gemini)
+PLAN    → generate test plan (LLM)
 ACT     → execute tests in Docker sandbox
-OBSERVE → analyze results (Gemini)
+OBSERVE → analyze results (LLM)
 DECIDE  → draft issue OR retry (up to MAX_ITERATIONS)
 STOP    → hand off to human for approval
 ```
@@ -151,6 +165,8 @@ STOP    → hand off to human for approval
 - Requires Docker Desktop running locally; tests will not execute without it.
 - Generated test code is syntax-validated but not semantically reviewed before execution.
 - RAG corpus is re-indexed on each run unless the ChromaDB persist directory already exists.
+- RAG embeddings use Gemini when configured, or a local model (all-MiniLM-L6-v2) when running Groq-only. Switching providers requires re-indexing (delete `evidence/chroma_db` and re-run `build_index()`).
+- Groq model IDs change over time as models are deprecated; check [Groq's model list](https://console.groq.com/docs/models) if you see a `model_not_found` error.
 - GitHub issue posting requires a valid token with `repo` scope; read-only tokens will fail at the approval step.
 
 ---

@@ -87,6 +87,28 @@ def _get_groq_client() -> Optional["Groq"]:
 
 
 # ---------------------------------------------------------------------------
+# Local embedding function (fallback when Gemini is not configured)
+# ---------------------------------------------------------------------------
+_local_embed_fn = None
+
+
+def _get_local_embed_fn():
+    """Return ChromaDB's default embedding function (all-MiniLM-L6-v2 via ONNX).
+
+    No API key required.  Downloads the model (~80 MB) on first use and
+    caches it at ``~/.cache/chroma/onnx_models/``.
+    """
+    global _local_embed_fn
+    if _local_embed_fn is None:
+        from chromadb.utils import embedding_functions
+        _local_embed_fn = embedding_functions.DefaultEmbeddingFunction()
+        logger.info(
+            "Local embedding function initialised (all-MiniLM-L6-v2, 384 dims)."
+        )
+    return _local_embed_fn
+
+
+# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
@@ -105,12 +127,18 @@ def generate(
     temperature: float = 0.2,
     max_retries: Optional[int] = None,
 ) -> str:
-    """Send *prompt* to Gemini and return the text response.
+    """Send *prompt* to an LLM and return the text response.
 
-    Transient server errors (5xx, 429, UNAVAILABLE, RESOURCE_EXHAUSTED) are
-    retried with exponential backoff.  If the primary model exhausts all
-    retries, the function falls back to the next model in the chain defined
-    by the ``GEMINI_FALLBACK_MODELS`` environment variable (comma-separated).
+    If ``GEMINI_API_KEY`` is set, Gemini is the primary provider.  Transient
+    server errors (5xx, 429, UNAVAILABLE, RESOURCE_EXHAUSTED) are retried with
+    exponential backoff.  If the primary model exhausts all retries, the
+    function falls back to the next model in the chain defined by the
+    ``GEMINI_FALLBACK_MODELS`` environment variable (comma-separated).  If all
+    Gemini models fail, Groq is tried as a cross-provider fallback.
+
+    If ``GEMINI_API_KEY`` is not set but ``GROQ_API_KEY`` is, Groq is used as
+    the sole provider.
+
     Non-transient errors (auth, bad request) are surfaced immediately.
 
     Args:
@@ -142,6 +170,37 @@ def generate(
     fallback_models = [m.strip() for m in fallback_str.split(",") if m.strip()]
     model_chain = [primary_model] + [m for m in fallback_models if m != primary_model]
 
+    prompt_hash = _hash(prompt)
+    t0 = time.monotonic()
+
+    # If Gemini is not configured, use Groq as the primary provider.
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not gemini_key:
+        logger.info(
+            "LLM call start (Groq primary — Gemini not configured)",
+            extra={
+                "event": "llm_call_start",
+                "model": "groq-primary",
+                "prompt_hash": prompt_hash,
+                "prompt_length": len(prompt),
+            },
+        )
+        if _get_groq_client() is None:
+            raise EnvironmentError(
+                "No LLM provider configured. Set GEMINI_API_KEY or GROQ_API_KEY "
+                "in your .env file."
+            )
+        groq_text = _generate_groq(
+            prompt, system_prompt, temperature, t0, prompt_hash, is_primary=True
+        )
+        if groq_text is not None:
+            return groq_text
+        raise RuntimeError(
+            "Groq call failed. Check that GROQ_MODEL is a valid model ID "
+            "(see https://console.groq.com/docs/models) and that your "
+            "GROQ_API_KEY is valid."
+        )
+
     client = _get_client()
 
     # Build the contents list — system prompt is passed via config, not contents
@@ -152,7 +211,6 @@ def generate(
         system_instruction=system_prompt,  # None is safely ignored by the SDK
     )
 
-    prompt_hash = _hash(prompt)
     logger.info(
         "LLM call start",
         extra={
@@ -163,7 +221,6 @@ def generate(
         },
     )
 
-    t0 = time.monotonic()
     last_exc: Optional[Exception] = None
     response = None
 
@@ -195,17 +252,21 @@ def generate(
                 last_exc = exc
                 exc_str = str(exc)
 
-                # Non-retryable: auth errors surface immediately
-                if "API_KEY_INVALID" in exc_str or "401" in exc_str or "403" in exc_str:
+                # Non-retryable: auth errors surface immediately.
+                # Use the exception's HTTP status code for reliable detection —
+                # substring matching on "401"/"403" causes false positives (e.g.
+                # the retry-delay "140130646s" in a 429 message contains "401").
+                exc_code = getattr(exc, "code", None)
+                if exc_code in (401, 403) or "API_KEY_INVALID" in exc_str:
                     latency_ms = int((time.monotonic() - t0) * 1000)
                     raise EnvironmentError(
                         f"Gemini authentication failed — check your GEMINI_API_KEY. "
                         f"Original error: {exc}"
                     ) from exc
 
-                is_transient = _is_transient_error(exc_str)
+                is_transient = exc_code in (429, 500, 502, 503) or _is_transient_error(exc_str)
                 is_model_not_found = (
-                    "404" in exc_str or "NOT_FOUND" in exc_str
+                    exc_code == 404 or "404" in exc_str or "NOT_FOUND" in exc_str
                     or "no longer available" in exc_str
                 )
                 retries_left = _max_retries - (attempt - 1)
@@ -229,24 +290,27 @@ def generate(
                     time.sleep(delay)
                     continue  # retry same model
 
-                # Retries exhausted (transient) or model deprecated (404)
-                should_fallback = (is_transient or is_model_not_found) and not is_last_model
+                # Retries exhausted (transient) or model deprecated (404) —
+                # fall back to next model in chain, or break to reach the
+                # cross-provider (Groq) safety net below.
+                should_fallback = is_transient or is_model_not_found
                 if should_fallback:
-                    logger.warning(
-                        "Model %s unavailable (%s), falling back to %s",
-                        current_model,
-                        "retries exhausted" if is_transient else "model not found",
-                        model_chain[chain_idx + 1],
-                        extra={
-                            "event": "llm_call_fallback",
-                            "model": model_chain[chain_idx + 1],
-                            "previous_model": current_model,
-                            "prompt_hash": prompt_hash,
-                        },
-                    )
-                    break  # exit inner loop -> try next model in chain
+                    if not is_last_model:
+                        logger.warning(
+                            "Model %s unavailable (%s), falling back to %s",
+                            current_model,
+                            "retries exhausted" if is_transient else "model not found",
+                            model_chain[chain_idx + 1],
+                            extra={
+                                "event": "llm_call_fallback",
+                                "model": model_chain[chain_idx + 1],
+                                "previous_model": current_model,
+                                "prompt_hash": prompt_hash,
+                            },
+                        )
+                    break  # exit inner loop -> try next model, or reach Groq
 
-                # Last model or non-transient error — fail
+                # Non-transient, non-auth error — fail immediately
                 latency_ms = int((time.monotonic() - t0) * 1000)
                 logger.error(
                     "LLM call failed",
@@ -333,8 +397,13 @@ def _generate_groq(
     temperature: float,
     t0: float,
     prompt_hash: str,
+    is_primary: bool = False,
 ) -> Optional[str]:
-    """Try generating a response using Groq as a cross-provider fallback.
+    """Generate a response using Groq.
+
+    When *is_primary* is True, Groq is the sole provider (Gemini not
+    configured).  Otherwise Groq is used as a cross-provider fallback after
+    all Gemini models have been exhausted.
 
     Returns the response text, or None if Groq is not configured or fails.
     """
@@ -342,23 +411,35 @@ def _generate_groq(
     if groq_client is None:
         return None
 
-    groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     messages: list = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    logger.info(
-        "Falling back to Groq (%s) after all Gemini models failed",
-        groq_model,
-        extra={
-            "event": "llm_call_fallback",
-            "model": groq_model,
-            "previous_model": "gemini (all exhausted)",
-            "prompt_hash": prompt_hash,
-        },
-    )
+    if is_primary:
+        logger.info(
+            "LLM call via Groq (%s) — primary provider",
+            groq_model,
+            extra={
+                "event": "llm_call_start",
+                "model": groq_model,
+                "prompt_hash": prompt_hash,
+                "prompt_length": len(prompt),
+            },
+        )
+    else:
+        logger.info(
+            "Falling back to Groq (%s) after all Gemini models failed",
+            groq_model,
+            extra={
+                "event": "llm_call_fallback",
+                "model": groq_model,
+                "previous_model": "gemini (all exhausted)",
+                "prompt_hash": prompt_hash,
+            },
+        )
 
     try:
         response = groq_client.chat.completions.create(
@@ -404,20 +485,62 @@ def _generate_groq(
 
 
 def embed(text: str, model: Optional[str] = None) -> list[float]:
-    """Return an embedding vector for *text* using Gemini's embedding model.
+    """Return an embedding vector for *text*.
+
+    Uses Gemini's embedding API when ``GEMINI_API_KEY`` is set.  Otherwise
+    falls back to a local model (all-MiniLM-L6-v2 via ChromaDB's default
+    embedding function) that requires no API key.
+
+    .. note::
+
+       Gemini and local embeddings have different dimensions (768 vs 384).
+       If you switch providers, delete the ChromaDB persist directory and
+       re-run ``build_index()`` to re-index with the new embedding model.
 
     Args:
         text:  The text to embed.
-        model: Embedding model ID.  Defaults to the GEMINI_EMBEDDING_MODEL env
-               var (fallback: ``gemini-embedding-001``).
+        model: Gemini embedding model ID (ignored when using local fallback).
+               Defaults to the GEMINI_EMBEDDING_MODEL env var
+               (fallback: ``gemini-embedding-001``).
 
     Returns:
         A list of floats representing the embedding vector.
 
     Raises:
-        EnvironmentError: GEMINI_API_KEY is missing.
-        RuntimeError:     Any API-level error.
+        RuntimeError: Any API-level error.
     """
+    # --- Local embedding fallback (no Gemini key needed) ---
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        ef = _get_local_embed_fn()
+        t0 = time.monotonic()
+        try:
+            vector = [float(x) for x in ef([text])[0]]
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            logger.error(
+                "Local embedding failed",
+                extra={
+                    "event": "embed_call_error",
+                    "model": "all-MiniLM-L6-v2",
+                    "latency_ms": latency_ms,
+                    "error": str(exc),
+                },
+            )
+            raise RuntimeError(f"Local embedding failed: {exc}") from exc
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        logger.debug(
+            "Embedding complete (local)",
+            extra={
+                "event": "embed_call_complete",
+                "model": "all-MiniLM-L6-v2",
+                "vector_dim": len(vector),
+                "latency_ms": latency_ms,
+            },
+        )
+        return vector
+
+    # --- Gemini embedding ---
     model_id = model or os.getenv(
         "GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"
     )
